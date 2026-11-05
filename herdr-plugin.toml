@@ -1,0 +1,28 @@
+id = "spaces-list"
+name = "Spaces List"
+version = "0.1.0"
+min_herdr_version = "0.9.0"
+description = "One list of spaces with their agents nested underneath."
+platforms = ["linux", "macos"]
+
+[[actions]]
+id = "toggle"
+title = "Toggle spaces list"
+description = "Open the list in this tab, focus it if open, close it if focused."
+command = ["python3", "spaces_list.py", "--toggle"]
+
+[[panes]]
+id = "list"
+title = "Spaces"
+placement = "split"
+command = ["python3", "spaces_list.py"]
+
+# Moving to a tab fires these even for new tabs and spaces. pane.focused is left
+# out on purpose: docking moves focus, and that must not re-trigger the hook.
+[[events]]
+on = "tab.focused"
+command = ["python3", "spaces_list.py", "--ensure"]
+
+[[events]]
+on = "workspace.focused"
+command = ["python3", "spaces_list.py", "--ensure"]
