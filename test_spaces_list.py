@@ -1,10 +1,12 @@
 import unittest
 
 from spaces_list import (
+    ONE_DARK,
     PAD_Y,
     agent_text,
     attention_sorted,
     build_rows,
+    configured_palette,
     ESCAPE,
     display_lines,
     edit_query,
@@ -16,6 +18,7 @@ from spaces_list import (
     has_room,
     leftmost_pane,
     list_pane_in_tab,
+    nearest_256,
     only_helpers_left,
     opening_key,
     parse_identity,
@@ -204,6 +207,26 @@ class FocusHook(unittest.TestCase):
         self.assertTrue(only_helpers_left(snap("Spaces", "Sidebar"), "t"))
         self.assertFalse(only_helpers_left(snap("Spaces", None), "t"))
         self.assertFalse(only_helpers_left(snap(), "t"))
+
+
+class Theme(unittest.TestCase):
+    def test_exact_palette_colors_map_exactly(self):
+        self.assertEqual(nearest_256("#5fafff"), 75)
+        self.assertEqual(nearest_256("#000000"), 16)
+        self.assertEqual(nearest_256("#808080"), 244)
+
+    def test_near_colors_pick_the_closest(self):
+        self.assertEqual(nearest_256("#60b0f0"), 75)
+
+    def test_config_selects_a_known_theme(self):
+        self.assertIs(configured_palette('[theme]\nname = "one-dark"\n'), ONE_DARK)
+
+    def test_other_or_missing_themes_keep_the_defaults(self):
+        self.assertIsNone(configured_palette('[theme]\nname = "nord"\n'))
+        self.assertIsNone(configured_palette("onboarding = false\n"))
+
+    def test_unreadable_config_keeps_the_defaults(self):
+        self.assertIsNone(configured_palette("not [valid toml"))
 
 
 class SelfReload(unittest.TestCase):

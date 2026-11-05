@@ -62,6 +62,31 @@ SESSION_COLORS = {
 }
 
 
+# Colours from herdr's own themes (src/app/state.rs). Other themes keep the
+# terminal-palette colours above.
+ONE_DARK = {
+    "text": "#abb2bf",
+    "red": "#e06c75",
+    "green": "#98c379",
+    "yellow": "#e5c07b",
+    "blue": "#61afef",
+    "mauve": "#c678dd",
+    "teal": "#56b6c2",
+    "peach": "#d19a66",
+}
+PALETTES = {"one-dark": ONE_DARK, "onedark": ONE_DARK}
+STATE_TOKENS = {"blocked": "red", "done": "green", "working": "yellow", "idle": "teal"}
+SESSION_TOKENS = {
+    "red": "red",
+    "blue": "blue",
+    "green": "green",
+    "yellow": "yellow",
+    "purple": "mauve",
+    "orange": "peach",
+    "cyan": "teal",
+}
+
+
 def rpc(method, params=None):
     """One newline-delimited JSON request over the herdr socket."""
     request = {"id": "spaces-list", "method": method, "params": params or {}}
@@ -422,7 +447,7 @@ def toggle():
         mark_closed(tab_id)
         herdr("pane", "close", pane_id)
     else:
-        herdr("plugin", "pane", "focus", pane_id)
+        rpc("pane.focus", {"pane_id": pane_id})
 
 
 def find():
@@ -434,7 +459,7 @@ def find():
         clear_closed(tab_id)
         pane_id = dock(snap, tab_id)
     else:
-        herdr("plugin", "pane", "focus", pane_id)
+        rpc("pane.focus", {"pane_id": pane_id})
     if pane_id:
         herdr("pane", "send-text", pane_id, "/")
 
@@ -504,30 +529,84 @@ def activate(row):
         herdr("workspace", "focus", row["target"])
 
 
-def source_mtime():
+def config_path():
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    return os.path.join(base, "herdr", "config.toml")
+
+
+def configured_palette(text):
+    """The palette for the theme named in herdr's config text, if we have one."""
     try:
-        return os.path.getmtime(os.path.abspath(__file__))
+        import tomllib
+        name = tomllib.loads(text).get("theme", {}).get("name")
+    except (ImportError, ValueError, AttributeError):
+        return None
+    return PALETTES.get(name)
+
+
+def load_palette():
+    try:
+        with open(config_path(), encoding="utf-8") as config:
+            return configured_palette(config.read())
     except OSError:
         return None
 
 
+def nearest_256(hex_color):
+    """The closest xterm-256 colour, from its colour cube and grey ramp."""
+    red, green, blue = (int(hex_color[i:i + 2], 16) for i in (1, 3, 5))
+    levels = [0, 95, 135, 175, 215, 255]
+    candidates = {
+        16 + 36 * r + 6 * g + b: (levels[r], levels[g], levels[b])
+        for r in range(6) for g in range(6) for b in range(6)
+    }
+    candidates.update({232 + i: (8 + 10 * i,) * 3 for i in range(24)})
+    return min(
+        candidates,
+        key=lambda code: sum((a - b) ** 2 for a, b in zip((red, green, blue), candidates[code])),
+    )
+
+
+def source_mtime():
+    """Change times of this script and herdr's config; None if the script is missing."""
+    try:
+        script = os.path.getmtime(os.path.abspath(__file__))
+    except OSError:
+        return None
+    try:
+        return (script, os.path.getmtime(config_path()))
+    except OSError:
+        return (script, None)
+
+
 def source_changed(started_with, current):
-    """True once this script is edited; a missing file is mid-save, so wait."""
+    """True once the script or config changes; a missing script is mid-save, so wait."""
     return current is not None and current != started_with
 
 
-def init_colors():
+def init_colors(palette=None):
     pairs = {}
     if not curses.has_colors():
         return pairs
     curses.start_color()
     curses.use_default_colors()
-    for number, (state, color) in enumerate(STATE_COLORS.items(), start=1):
-        curses.init_pair(number, color, -1)
-        pairs[state] = curses.color_pair(number)
     wide = curses.COLORS >= 256
+    themed = palette if wide else None
+    if themed:
+        text_pair = len(STATE_COLORS) + len(SESSION_COLORS) + 1
+        curses.init_pair(text_pair, nearest_256(themed["text"]), -1)
+        pairs["text"] = curses.color_pair(text_pair)
+    for number, (state, color) in enumerate(STATE_COLORS.items(), start=1):
+        code = nearest_256(themed[STATE_TOKENS[state]]) if themed else color
+        curses.init_pair(number, code, -1)
+        pairs[state] = curses.color_pair(number)
     for number, (name, codes) in enumerate(SESSION_COLORS.items(), start=len(STATE_COLORS) + 1):
-        curses.init_pair(number, codes[0] if wide else codes[1], -1)
+        token = SESSION_TOKENS.get(name)
+        if themed and token:
+            code = nearest_256(themed[token])
+        else:
+            code = codes[0] if wide else codes[1]
+        curses.init_pair(number, code, -1)
         pairs[name] = curses.color_pair(number)
     return pairs
 
@@ -621,7 +700,7 @@ def draw(window, rows, cursor, top, colors, notice, query=None):
         if index == cursor:
             # One solid bar: restyle the whole line rather than each piece.
             try:
-                window.chgat(y, 0, width, curses.A_REVERSE | curses.A_BOLD)
+                window.chgat(y, 0, width, curses.A_REVERSE | curses.A_BOLD | colors.get("text", 0))
             except curses.error:
                 pass
     if query is not None:
@@ -654,7 +733,8 @@ def run(window):
     window.timeout(100)
     # Esc must clear a filter at once, not after curses' default one second wait.
     curses.set_escdelay(25)
-    colors = init_colors()
+    colors = init_colors(load_palette())
+    window.bkgd(" ", colors.get("text", 0))
     all_rows, rows, cursor, top, notice = [], [], 0, 0, ""
     query = None
     selected_key = None

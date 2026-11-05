@@ -53,6 +53,7 @@ sidebar_collapsed_mode = "hidden"
 - Find matches every word you type against the session name, agent, title, status, tab, folder and space, so `docs blocked` works. Panes without an agent aren't listed.
 - The list opens by itself when you move to a tab that doesn't have one, and focus stays on your work.
 - Spaces that need you sort to the top: blocked first, then done. Set `SORT_BY_ATTENTION = False` in `spaces_list.py` to keep herdr's order.
+- With herdr's `one-dark` theme, the list uses that theme's colors. Other themes use your terminal's palette.
 - The highlight follows the focused pane, except while the list itself has focus.
 - Claude Code sessions show their `/rename` name and `/color`. These are read from Claude Code's internal files under `~/.claude`, so an update could change them; rows then fall back to the default text.
 
@@ -70,7 +71,7 @@ python3 -m unittest
 herdr plugin link "$PWD"
 ```
 
-Open lists reload themselves when `spaces_list.py` changes.
+Open lists reload themselves when `spaces_list.py` or herdr's config changes.
 
 ## License
 
