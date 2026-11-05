@@ -2,15 +2,9 @@
 
 A [herdr](https://github.com/herdrdev/herdr) plugin that merges the Spaces and Agents panels into one list, with each agent nested under its space.
 
-```
-◐ web-app
- └ ◐ test
-○ api
- └ ○ codex · api
-○ docs
- ├ ○ t1 release-notes
- └ ○ t2 changelog
-```
+<img src="docs/screenshot.png" alt="The plugin's list: spaces with their agents nested underneath, showing status symbols and session colors" width="340">
+
+*The plugin's real output, shown with example data.*
 
 Status symbols: `!` blocked, `✓` done, `◐` working, `○` idle, `·` nothing detected.
 
