@@ -11,6 +11,12 @@ title = "Toggle spaces list"
 description = "Open the list in this tab, focus it if open, close it if focused."
 command = ["python3", "spaces_list.py", "--toggle"]
 
+[[actions]]
+id = "find"
+title = "Find in spaces list"
+description = "Open or focus the list and start filtering."
+command = ["python3", "spaces_list.py", "--find"]
+
 [[panes]]
 id = "list"
 title = "Spaces"

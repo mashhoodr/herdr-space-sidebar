@@ -1,8 +1,17 @@
 import unittest
 
 from spaces_list import (
+    PAD_Y,
+    agent_text,
+    attention_sorted,
     build_rows,
+    ESCAPE,
+    display_lines,
+    edit_query,
+    ellipsize,
     event_tab,
+    filter_rows,
+    first_match,
     followed_key,
     has_room,
     leftmost_pane,
@@ -10,6 +19,10 @@ from spaces_list import (
     only_helpers_left,
     opening_key,
     parse_identity,
+    row_at,
+    scroll_top,
+    source_changed,
+    text_width,
     user_session_name,
 )
 
@@ -59,24 +72,30 @@ class BuildRows(unittest.TestCase):
         rows = build_rows(snapshot())
         self.assertEqual(
             [(r["kind"], r["target"]) for r in rows],
-            [("space", "w1"), ("agent", "w1:p1"),
-             ("space", "w2"),
-             ("space", "w3"), ("agent", "w3:p1"), ("agent", "w3:p3")],
+            [("space", "w3"), ("agent", "w3:p1"), ("agent", "w3:p3"),
+             ("space", "w1"), ("agent", "w1:p1"),
+             ("space", "w2")],
         )
 
     def test_space_row_carries_rollup_state(self):
-        docs = build_rows(snapshot())[3]
+        docs = next(r for r in build_rows(snapshot()) if r["target"] == "w3")
         self.assertEqual(docs["text"], "docs")
         self.assertEqual(docs["state"], "done")
 
-    def test_tab_number_only_shown_when_space_has_several_tabs(self):
-        rows = {r["target"]: r["text"] for r in build_rows(snapshot())}
-        self.assertEqual(rows["w1:p1"], "claude · test")
-        self.assertEqual(rows["w3:p3"], "t2 claude · later tab")
+    def test_tab_number_is_a_separate_detail_only_with_several_tabs(self):
+        rows = {r["target"]: r for r in build_rows(snapshot())}
+        self.assertEqual(rows["w1:p1"]["text"], "claude · test")
+        self.assertEqual(rows["w1:p1"]["detail"], "")
+        self.assertEqual(rows["w3:p3"]["text"], "claude · later tab")
+        self.assertEqual(rows["w3:p3"]["detail"], "t2")
 
     def test_title_matching_agent_name_is_not_repeated(self):
         rows = {r["target"]: r["text"] for r in build_rows(snapshot())}
-        self.assertEqual(rows["w3:p1"], "t1 codex")
+        self.assertEqual(rows["w3:p1"], "codex")
+
+    def test_filler_title_is_hidden(self):
+        agent = {"agent": "claude", "terminal_title_stripped": "Claude Code"}
+        self.assertEqual(agent_text(agent), "claude")
 
     def test_marks_current_space_and_focused_agent(self):
         rows = {r["target"]: r for r in build_rows(snapshot())}
@@ -117,10 +136,11 @@ class SessionIdentity(unittest.TestCase):
         self.assertEqual(rows["w1:p1"]["text"], "my session")
         self.assertEqual(rows["w1:p1"]["color"], "blue")
 
-    def test_session_name_keeps_tab_prefix(self):
+    def test_session_name_keeps_tab_detail(self):
         identities = {"w3:p3": {"name": "later", "color": None}}
         rows = {r["target"]: r for r in build_rows(snapshot(), identities)}
-        self.assertEqual(rows["w3:p3"]["text"], "t2 later")
+        self.assertEqual(rows["w3:p3"]["text"], "later")
+        self.assertEqual(rows["w3:p3"]["detail"], "t2")
 
     def test_color_without_a_name_keeps_the_default_text(self):
         identities = {"w1:p1": {"name": None, "color": "green"}}
@@ -184,6 +204,113 @@ class FocusHook(unittest.TestCase):
         self.assertTrue(only_helpers_left(snap("Spaces", "Sidebar"), "t"))
         self.assertFalse(only_helpers_left(snap("Spaces", None), "t"))
         self.assertFalse(only_helpers_left(snap(), "t"))
+
+
+class SelfReload(unittest.TestCase):
+    def test_reloads_only_on_a_real_change(self):
+        self.assertFalse(source_changed(100.0, 100.0))
+        self.assertTrue(source_changed(100.0, 101.0))
+
+    def test_missing_file_does_not_reload(self):
+        self.assertFalse(source_changed(100.0, None))
+
+
+class Find(unittest.TestCase):
+    def rows(self):
+        return build_rows(snapshot(), {"w3:p3": {"name": "changelog", "color": None}})
+
+    def targets(self, query):
+        return [r["target"] for r in filter_rows(self.rows(), query)]
+
+    def test_empty_query_keeps_everything(self):
+        self.assertEqual(len(self.targets("  ")), len(self.rows()))
+
+    def test_agent_match_keeps_its_space_and_drops_siblings(self):
+        self.assertEqual(self.targets("changelog"), ["w3", "w3:p3"])
+
+    def test_space_match_keeps_all_its_agents(self):
+        self.assertEqual(self.targets("docs"), ["w3", "w3:p1", "w3:p3"])
+
+    def test_every_word_must_match_across_space_and_agent(self):
+        self.assertEqual(self.targets("docs codex"), ["w3", "w3:p1"])
+        self.assertEqual(self.targets("api codex"), [])
+
+    def test_status_word_selects_agents_in_that_state(self):
+        self.assertEqual(self.targets("working"), ["w1", "w1:p1"])
+
+    def test_match_ignores_case(self):
+        self.assertEqual(self.targets("CHANGELOG"), ["w3", "w3:p3"])
+
+    def test_cursor_lands_on_first_agent_when_there_is_one(self):
+        self.assertEqual(first_match(filter_rows(self.rows(), "changelog")), 1)
+        self.assertEqual(first_match([{"kind": "space"}]), 0)
+        self.assertEqual(first_match([]), 0)
+
+    def test_typing_editing_and_leaving(self):
+        self.assertEqual(edit_query("ab", ord("c")), "abc")
+        self.assertEqual(edit_query("ab", 127), "a")
+        self.assertEqual(edit_query("", 127), "")
+        self.assertEqual(edit_query("ab", 21), "")
+        self.assertIsNone(edit_query("ab", ESCAPE))
+        self.assertEqual(edit_query("ab", 500), "ab", "other keys change nothing")
+
+
+class Attention(unittest.TestCase):
+    def test_blocked_then_done_then_the_rest_in_original_order(self):
+        spaces = [{"agent_status": s, "n": i} for i, s in
+                  enumerate(["idle", "done", "working", "blocked", "done"])]
+        self.assertEqual([s["n"] for s in attention_sorted(spaces)], [3, 1, 4, 0, 2])
+
+
+class Fitting(unittest.TestCase):
+    def test_short_text_is_untouched(self):
+        self.assertEqual(ellipsize("short", 5), "short")
+
+    def test_long_text_ends_in_ellipsis_within_the_limit(self):
+        result = ellipsize("release-notes-long", 8)
+        self.assertEqual(result, "release…")
+        self.assertEqual(text_width(result), 8)
+
+    def test_no_dangling_space_before_ellipsis(self):
+        self.assertEqual(ellipsize("codex · lint", 7), "codex…")
+
+    def test_no_room_gives_nothing(self):
+        self.assertEqual(ellipsize("text", 0), "")
+
+    def test_wide_characters_count_double(self):
+        self.assertEqual(text_width("日本"), 4)
+        self.assertLessEqual(text_width(ellipsize("日本語のタイトル", 6)), 6)
+
+
+class Spacing(unittest.TestCase):
+    ROWS = [{"kind": "space"}, {"kind": "agent"}, {"kind": "space"}, {"kind": "space"}, {"kind": "agent"}]
+
+    def test_gap_before_every_space_but_the_first(self):
+        self.assertEqual(display_lines(self.ROWS), [0, 1, None, 2, None, 3, 4])
+
+    def test_no_rows_no_lines(self):
+        self.assertEqual(display_lines([]), [])
+
+    def test_click_maps_past_gaps_and_padding(self):
+        lines = display_lines(self.ROWS)
+        self.assertEqual(row_at(lines, 0, PAD_Y), 0)
+        self.assertEqual(row_at(lines, 0, PAD_Y + 3), 2)
+        self.assertIsNone(row_at(lines, 0, PAD_Y + 2), "a gap is not a row")
+        self.assertIsNone(row_at(lines, 0, PAD_Y - 1), "padding is not a row")
+        self.assertIsNone(row_at(lines, 0, PAD_Y + 7), "below the list")
+
+    def test_click_accounts_for_scrolling(self):
+        lines = display_lines(self.ROWS)
+        self.assertEqual(row_at(lines, 3, PAD_Y), 2)
+
+    def test_scroll_keeps_cursor_visible_counting_gaps(self):
+        lines = display_lines(self.ROWS)
+        self.assertEqual(scroll_top(lines, 4, 0, 3), 4)
+        self.assertEqual(scroll_top(lines, 0, 4, 3), 0)
+        self.assertEqual(scroll_top(lines, 1, 0, 3), 0)
+
+    def test_scroll_pulls_back_when_the_list_shrinks(self):
+        self.assertEqual(scroll_top([0, 1], 0, 5, 3), 0)
 
 
 class Layout(unittest.TestCase):

@@ -24,6 +24,12 @@ key = "prefix+a"
 type = "plugin_action"
 command = "spaces-list.toggle"
 description = "toggle spaces list"
+
+[[keys.command]]
+key = "prefix+/"
+type = "plugin_action"
+command = "spaces-list.find"
+description = "find in spaces list"
 ```
 
 To hide herdr's own sidebar, add the settings below and press `prefix+b`:
@@ -40,10 +46,13 @@ sidebar_collapsed_mode = "hidden"
 |---|---|
 | `j` / `k` or arrows | Move |
 | Enter or click | Jump to that agent or space |
+| `/` or `prefix+/` | Find: type to filter, Esc to clear |
 | `q` or Esc | Close the list and keep it closed in this tab |
 | `prefix+a` | Open, focus, or close the list |
 
+- Find matches every word you type against the session name, agent, title, status, tab, folder and space, so `docs blocked` works. Panes without an agent aren't listed.
 - The list opens by itself when you move to a tab that doesn't have one, and focus stays on your work.
+- Spaces that need you sort to the top: blocked first, then done. Set `SORT_BY_ATTENTION = False` in `spaces_list.py` to keep herdr's order.
 - The highlight follows the focused pane, except while the list itself has focus.
 - Claude Code sessions show their `/rename` name and `/color`. These are read from Claude Code's internal files under `~/.claude`, so an update could change them; rows then fall back to the default text.
 
@@ -61,7 +70,7 @@ python3 -m unittest
 herdr plugin link "$PWD"
 ```
 
-Open lists keep running the old code until you close and reopen them.
+Open lists reload themselves when `spaces_list.py` changes.
 
 ## License
 

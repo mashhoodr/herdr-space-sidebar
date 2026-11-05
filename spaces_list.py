@@ -15,6 +15,7 @@ import socket
 import subprocess
 import sys
 import time
+import unicodedata
 
 PLUGIN_ID = "spaces-list"
 ENTRYPOINT = "list"
@@ -22,9 +23,23 @@ LABEL = "Spaces"
 HELPER_LABELS = (LABEL, "Sidebar")
 MIN_TAB_WIDTH = 100
 WIDTH = 32
+PAD_X = 1
+PAD_Y = 1
+FOOTER_LINES = 2
 REFRESH_SECONDS = 0.3
 IDENTITY_REFRESH_SECONDS = 5.0
 TRANSCRIPT_TAIL_BYTES = 1024 * 1024
+# Move spaces that need you to the top. Positions then shift as statuses change.
+SORT_BY_ATTENTION = True
+ATTENTION_ORDER = {"blocked": 0, "done": 1}
+# Default terminal titles that say nothing beyond the agent's name.
+FILLER_TITLES = {"claude code"}
+ENTER_KEYS = (curses.KEY_ENTER, 10, 13)
+BACKSPACE_KEYS = (curses.KEY_BACKSPACE, 127, 8)
+ESCAPE = 27
+CTRL_U = 21
+# Keys that keep working normally while typing a filter.
+FILTER_PASSTHROUGH = (curses.KEY_UP, curses.KEY_DOWN, curses.KEY_MOUSE, curses.KEY_RESIZE) + ENTER_KEYS
 
 SYMBOLS = {"blocked": "!", "done": "✓", "working": "◐", "idle": "○", "unknown": "·"}
 # curses colour pair for each state; pair numbers are assigned in init_colors.
@@ -148,22 +163,110 @@ def refresh_identities(snap, identities):
             identities[pane_id] = identity
 
 
-def agent_text(agent, tab_number, session_name=None):
+def agent_text(agent, session_name=None):
+    if session_name:
+        return session_name
     name = agent.get("label") or agent.get("agent") or "agent"
     title = agent.get("terminal_title_stripped") or ""
-    text = name if title in ("", name) else f"{name} · {title}"
-    text = session_name or text
-    return f"t{tab_number} {text}" if tab_number else text
+    if title in ("", name) or title.lower() in FILLER_TITLES:
+        return name
+    return f"{name} · {title}"
+
+
+def attention_sorted(spaces):
+    """Blocked spaces first, then done; each group keeps herdr's own order."""
+    if not SORT_BY_ATTENTION:
+        return list(spaces)
+    return sorted(spaces, key=lambda s: ATTENTION_ORDER.get(s.get("agent_status"), 2))
+
+
+def text_width(text):
+    """Terminal columns a string occupies; wide characters take two."""
+    width = 0
+    for char in text:
+        if unicodedata.combining(char):
+            continue
+        width += 2 if unicodedata.east_asian_width(char) in ("W", "F") else 1
+    return width
+
+
+def ellipsize(text, columns):
+    """Cut text to fit the given columns, ending in … when anything was lost."""
+    if text_width(text) <= columns:
+        return text
+    if columns <= 0:
+        return ""
+    kept = ""
+    for char in text:
+        if text_width(kept + char) > columns - 1:
+            break
+        kept += char
+    return kept.rstrip() + "…"
+
+
+def agent_search_text(agent, text, tab_label, space_label):
+    """Everything a filter can match on for one agent, lowercased."""
+    cwd = os.path.basename((agent.get("foreground_cwd") or agent.get("cwd") or "").rstrip("/"))
+    fields = (text, agent.get("agent"), agent.get("agent_status"), agent.get("terminal_title_stripped"),
+              tab_label, cwd, space_label)
+    return " ".join(field for field in fields if field).lower()
+
+
+def filter_rows(rows, query):
+    """Rows matching every word: a matching space keeps all its agents."""
+    words = query.lower().split()
+    if not words:
+        return rows
+    matches = lambda row: all(word in row["search"] for word in words)
+    kept, space, agents = [], None, []
+
+    def flush():
+        if space is None:
+            return
+        if matches(space):
+            kept.extend([space] + agents)
+        else:
+            hits = [agent for agent in agents if matches(agent)]
+            if hits:
+                kept.extend([space] + hits)
+
+    for row in rows:
+        if row["kind"] == "space":
+            flush()
+            space, agents = row, []
+        else:
+            agents.append(row)
+    flush()
+    return kept
+
+
+def first_match(rows):
+    """Where the cursor lands after a filter change: the first agent, if any."""
+    return next((i for i, row in enumerate(rows) if row["kind"] == "agent"), 0)
+
+
+def edit_query(query, key):
+    """The filter text after a key press; None means leave filter mode."""
+    if key == ESCAPE:
+        return None
+    if key in BACKSPACE_KEYS:
+        return query[:-1]
+    if key == CTRL_U:
+        return ""
+    if 32 <= key < 127:
+        return query + chr(key)
+    return query
 
 
 def build_rows(snap, identities=None):
     """Flatten a session snapshot into space rows followed by their agents."""
     identities = identities or {}
     tab_numbers = {t["tab_id"]: t.get("number", 0) for t in snap.get("tabs", [])}
+    tab_labels = {t["tab_id"]: t.get("label", "") for t in snap.get("tabs", [])}
     focused_space = snap.get("focused_workspace_id")
     focused_pane = snap.get("focused_pane_id")
     rows = []
-    for space in snap.get("workspaces", []):
+    for space in attention_sorted(snap.get("workspaces", [])):
         space_id = space["workspace_id"]
         rows.append({
             "kind": "space",
@@ -171,6 +274,8 @@ def build_rows(snap, identities=None):
             "tab": space.get("active_tab_id"),
             "state": space.get("agent_status", "unknown"),
             "text": space.get("label") or space_id,
+            "detail": "",
+            "search": (space.get("label") or space_id).lower(),
             "current": space_id == focused_space,
         })
         agents = [a for a in snap.get("agents", []) if a.get("workspace_id") == space_id]
@@ -179,12 +284,17 @@ def build_rows(snap, identities=None):
         for agent in agents:
             number = tab_numbers.get(agent.get("tab_id"), 0) if several_tabs else 0
             identity = identities.get(agent["pane_id"], {})
+            text = agent_text(agent, identity.get("name"))
             rows.append({
                 "kind": "agent",
                 "target": agent["pane_id"],
                 "tab": agent.get("tab_id"),
                 "state": agent.get("agent_status", "unknown"),
-                "text": agent_text(agent, number, identity.get("name")),
+                "text": text,
+                "search": agent_search_text(
+                    agent, text, tab_labels.get(agent.get("tab_id")), space.get("label")
+                ),
+                "detail": f"t{number}" if number else "",
                 "color": identity.get("color"),
                 "current": agent["pane_id"] == focused_pane,
             })
@@ -315,6 +425,20 @@ def toggle():
         herdr("plugin", "pane", "focus", pane_id)
 
 
+def find():
+    """Open or focus the list in this tab and start filtering straight away."""
+    snap = fetch_snapshot()
+    tab_id = snap.get("focused_tab_id")
+    pane_id = list_pane_in_tab(snap, tab_id)
+    if pane_id is None:
+        clear_closed(tab_id)
+        pane_id = dock(snap, tab_id)
+    else:
+        herdr("plugin", "pane", "focus", pane_id)
+    if pane_id:
+        herdr("pane", "send-text", pane_id, "/")
+
+
 def event_tab(event, snap):
     """The tab a focus event is moving to; global focus may still be the old one."""
     data = event.get("data", event)
@@ -380,6 +504,18 @@ def activate(row):
         herdr("workspace", "focus", row["target"])
 
 
+def source_mtime():
+    try:
+        return os.path.getmtime(os.path.abspath(__file__))
+    except OSError:
+        return None
+
+
+def source_changed(started_with, current):
+    """True once this script is edited; a missing file is mid-save, so wait."""
+    return current is not None and current != started_with
+
+
 def init_colors():
     pairs = {}
     if not curses.has_colors():
@@ -405,33 +541,98 @@ def put(window, y, x, text, attr=0):
             pass
 
 
-def draw(window, rows, cursor, top, colors, notice):
+def display_lines(rows):
+    """Screen lines as row indexes, with None for the gap between spaces."""
+    lines = []
+    for index, row in enumerate(rows):
+        if row["kind"] == "space" and lines:
+            lines.append(None)
+        lines.append(index)
+    return lines
+
+
+def scroll_top(lines, cursor, top, body):
+    """The first visible line that keeps the cursor's row on screen."""
+    position = lines.index(cursor) if cursor in lines else 0
+    if position < top:
+        top = position
+    elif position >= top + body:
+        top = position - body + 1
+    return max(0, min(top, max(len(lines) - body, 0)))
+
+
+def row_at(lines, top, y):
+    """The row drawn at screen line y, or None for gaps and empty space."""
+    position = top + y - PAD_Y
+    if y < PAD_Y or not 0 <= position < len(lines):
+        return None
+    return lines[position]
+
+
+def body_height(height):
+    return max(height - PAD_Y - FOOTER_LINES, 1)
+
+
+def row_styles(row, colors):
+    """(symbol attr, text attr) for a row, with blocked rows taking over both."""
+    blocked = curses.A_BOLD | colors.get("blocked", 0)
+    if row["state"] == "blocked":
+        return blocked, blocked
+    state_attr = colors.get(row["state"], curses.A_DIM)
+    if row["kind"] == "space":
+        return state_attr | curses.A_DIM, curses.A_BOLD
+    text_attr = curses.A_BOLD if row["current"] else 0
+    return state_attr, text_attr | colors.get(row.get("color"), 0)
+
+
+def draw_row(window, y, row, last_in_space, colors):
+    width = window.getmaxyx()[1]
+    right_edge = width - 1 - PAD_X
+    symbol = SYMBOLS.get(row["state"], "·")
+    symbol_attr, text_attr = row_styles(row, colors)
+    if row["kind"] == "space":
+        symbol_x = PAD_X
+    else:
+        put(window, y, PAD_X, f" {'└' if last_in_space else '├'} ", curses.A_DIM)
+        symbol_x = PAD_X + 3
+    put(window, y, symbol_x, symbol, symbol_attr)
+    text_x = symbol_x + 2
+    detail = row.get("detail", "")
+    room = right_edge - text_x - (len(detail) + 1 if detail else 0)
+    put(window, y, text_x, ellipsize(row["text"], room), text_attr)
+    if detail:
+        put(window, y, right_edge - len(detail), detail, curses.A_DIM)
+
+
+def draw(window, rows, cursor, top, colors, notice, query=None):
     window.erase()
-    height, _ = window.getmaxyx()
-    body = max(height - 1, 1)
+    height, width = window.getmaxyx()
+    lines = display_lines(rows)
     last_index = {}
     for index, row in enumerate(rows):
         if row["kind"] == "agent":
             last_index[row["space_index"]] = index
-    for y, index in enumerate(range(top, min(top + body, len(rows)))):
+    for offset, index in enumerate(lines[top:top + body_height(height)]):
+        if index is None:
+            continue
+        y = PAD_Y + offset
         row = rows[index]
-        symbol = SYMBOLS.get(row["state"], "·")
-        state_attr = colors.get(row["state"], curses.A_DIM)
-        selected = curses.A_REVERSE if index == cursor else 0
-        if row["kind"] == "space":
-            put(window, y, 0, symbol, state_attr | selected)
-            label = f" {row['text']}"
-            attr = curses.A_BOLD if row["current"] else 0
-            put(window, y, 1, label, attr | selected)
-        else:
-            branch = "└" if last_index.get(row["space_index"]) == index else "├"
-            put(window, y, 0, f" {branch} ", curses.A_DIM | selected)
-            put(window, y, 3, symbol, state_attr | selected)
-            attr = curses.A_BOLD if row["current"] else 0
-            attr |= colors.get(row.get("color"), 0)
-            put(window, y, 4, f" {row['text']}", attr | selected)
-    footer = notice or "↑↓/jk move · ⏎ jump · q close"
-    put(window, height - 1, 0, footer, curses.A_DIM)
+        draw_row(window, y, row, last_index.get(row["space_index"]) == index, colors)
+        if index == cursor:
+            # One solid bar: restyle the whole line rather than each piece.
+            try:
+                window.chgat(y, 0, width, curses.A_REVERSE | curses.A_BOLD)
+            except curses.error:
+                pass
+    if query is not None:
+        if not rows:
+            put(window, PAD_Y, PAD_X, "no matches", curses.A_DIM)
+        # Keep the end of a long query visible, since that's where you're typing.
+        visible = query[-max(width - PAD_X - 4, 1):]
+        put(window, height - 1, PAD_X, f"/{visible}█", curses.A_BOLD)
+    else:
+        footer = notice or "↑↓ move · / find · ⏎ jump"
+        put(window, height - 1, PAD_X, footer, curses.A_DIM)
     window.refresh()
 
 
@@ -451,15 +652,23 @@ def run(window):
     curses.mousemask(curses.ALL_MOUSE_EVENTS)
     curses.mouseinterval(0)
     window.timeout(100)
+    # Esc must clear a filter at once, not after curses' default one second wait.
+    curses.set_escdelay(25)
     colors = init_colors()
-    rows, cursor, top, notice = [], 0, 0, ""
+    all_rows, rows, cursor, top, notice = [], [], 0, 0, ""
+    query = None
     selected_key = None
     next_refresh = 0.0
     identities, next_identities = {}, 0.0
     own_pane = os.environ.get("HERDR_PANE_ID")
     own_tab = os.environ.get("HERDR_TAB_ID")
+    started_with = source_mtime()
     while True:
         if time.monotonic() >= next_refresh:
+            if source_changed(started_with, source_mtime()):
+                # Open lists would otherwise run old code until closed by hand.
+                curses.endwin()
+                os.execv(sys.executable, [sys.executable] + sys.argv)
             try:
                 snap = fetch_snapshot()
                 if only_helpers_left(snap, own_tab):
@@ -467,12 +676,15 @@ def run(window):
                 if time.monotonic() >= next_identities:
                     refresh_identities(snap, identities)
                     next_identities = time.monotonic() + IDENTITY_REFRESH_SECONDS
-                rows = index_rows(build_rows(snap, identities))
-                followed = followed_key(snap, own_pane, rows)
+                all_rows = build_rows(snap, identities)
+                followed = followed_key(snap, own_pane, all_rows)
                 if followed:
+                    # Focus moved away, so a half-typed filter no longer applies.
+                    query = None
                     selected_key = followed
                 elif selected_key is None:
                     selected_key = opening_key(snap, own_pane, own_tab)
+                rows = index_rows(filter_rows(all_rows, query or ""))
                 notice = ""
             except (OSError, RuntimeError, ValueError) as error:
                 notice = f"error: {error}"
@@ -482,24 +694,29 @@ def run(window):
             if selected_key in keys:
                 cursor = keys.index(selected_key)
         cursor = max(0, min(cursor, len(rows) - 1))
-        height = window.getmaxyx()[0]
-        body = max(height - 1, 1)
-        if cursor < top:
-            top = cursor
-        elif cursor >= top + body:
-            top = cursor - body + 1
-        draw(window, rows, cursor, top, colors, notice)
+        lines = display_lines(rows)
+        top = scroll_top(lines, cursor, top, body_height(window.getmaxyx()[0]))
+        draw(window, rows, cursor, top, colors, notice, query)
 
         key = window.getch()
         target_row = None
-        if key in (ord("q"), 27):
+        if query is not None and key != -1 and key not in FILTER_PASSTHROUGH:
+            before = query
+            query = edit_query(query, key)
+            if query != before:
+                rows = index_rows(filter_rows(all_rows, query or ""))
+                cursor = first_match(rows)
+            key = -1
+        if key in (ord("q"), ESCAPE):
             mark_closed(own_tab)
             return
-        if key in (ord("j"), curses.KEY_DOWN):
+        if key == ord("/"):
+            query = ""
+        elif key in (ord("j"), curses.KEY_DOWN):
             cursor += 1
         elif key in (ord("k"), curses.KEY_UP):
             cursor -= 1
-        elif key in (curses.KEY_ENTER, 10, 13):
+        elif key in ENTER_KEYS:
             target_row = cursor
         elif key == curses.KEY_RESIZE:
             next_refresh = 0.0
@@ -508,8 +725,8 @@ def run(window):
                 _, _, y, _, state = curses.getmouse()
             except curses.error:
                 continue
-            clicked = top + y
-            if state & (curses.BUTTON1_CLICKED | curses.BUTTON1_PRESSED) and clicked < len(rows):
+            clicked = row_at(lines, top, y)
+            if state & (curses.BUTTON1_CLICKED | curses.BUTTON1_PRESSED) and clicked is not None:
                 cursor = clicked
                 target_row = clicked
         if rows:
@@ -518,6 +735,7 @@ def run(window):
         if target_row is not None and target_row < len(rows):
             try:
                 activate(rows[target_row])
+                query = None
                 next_refresh = 0.0
             except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
                 notice = f"error: {error}"
@@ -526,6 +744,9 @@ def run(window):
 def main():
     if "--toggle" in sys.argv[1:]:
         toggle()
+        return
+    if "--find" in sys.argv[1:]:
+        find()
         return
     if "--ensure" in sys.argv[1:]:
         ensure()
