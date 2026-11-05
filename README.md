@@ -62,3 +62,7 @@ herdr plugin link "$PWD"
 ```
 
 Open lists keep running the old code until you close and reopen them.
+
+## License
+
+[MIT](LICENSE)
