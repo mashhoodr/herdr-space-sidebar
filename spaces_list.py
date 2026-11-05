@@ -11,6 +11,7 @@ import glob
 import json
 import locale
 import os
+import shlex
 import socket
 import subprocess
 import sys
@@ -21,6 +22,7 @@ PLUGIN_ID = "spaces-list"
 ENTRYPOINT = "list"
 LABEL = "Spaces"
 HELPER_LABELS = (LABEL, "Sidebar")
+SHELLS = ("fish", "zsh", "bash", "sh", "dash", "ksh")
 MIN_TAB_WIDTH = 100
 WIDTH = 32
 PAD_X = 1
@@ -362,6 +364,42 @@ def list_pane_in_tab(snap, tab_id):
     return None
 
 
+def list_process_state(processes):
+    """What a list pane is doing: "running", a bare "shell", or something "other"."""
+    if any("spaces_list.py" in (p.get("cmdline") or "") for p in processes):
+        return "running"
+    names = [os.path.basename(p.get("argv0") or "").lstrip("-") for p in processes]
+    return "shell" if names and all(name in SHELLS for name in names) else "other"
+
+
+def revive(pane_id, attempts=20):
+    """Herdr restores a list pane as a plain shell: start the list in it again.
+
+    This keeps the pane's place and width, and leaves anything else running there
+    alone. Returns True when the pane is now running the list or was told to.
+    """
+    for _ in range(attempts):
+        info = rpc("pane.process_info", {"pane_id": pane_id})["process_info"]
+        state = list_process_state(info.get("foreground_processes", []))
+        if state == "running":
+            return True
+        if state == "shell":
+            command = f"exec {shlex.quote(sys.executable)} {shlex.quote(os.path.abspath(__file__))}"
+            herdr("pane", "send-text", pane_id, command + "\n")
+            return True
+        if info.get("foreground_processes"):
+            return False
+        time.sleep(0.25)
+    return False
+
+
+def revive_all():
+    """Startup hook: bring back every list that a server restart turned into a shell."""
+    for pane in fetch_snapshot().get("panes", []):
+        if pane.get("label") == LABEL:
+            revive(pane["pane_id"])
+
+
 def dock(snap, tab_id):
     """Open the list at the left edge of a tab and size it to WIDTH columns.
 
@@ -436,14 +474,22 @@ def sweep_closed_markers(snap):
             os.remove(path)
 
 
+def dock_once(tab_id):
+    """Open a list unless a focus hook just did; both take the same lock."""
+    with open(os.path.join(state_dir(), "dock.lock"), "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        snap = fetch_snapshot()
+        return list_pane_in_tab(snap, tab_id) or dock(snap, tab_id)
+
+
 def toggle():
     snap = fetch_snapshot()
     tab_id = snap.get("focused_tab_id")
     pane_id = list_pane_in_tab(snap, tab_id)
     if pane_id is None:
         clear_closed(tab_id)
-        dock(snap, tab_id)
-    elif pane_id == snap.get("focused_pane_id"):
+        dock_once(tab_id)
+    elif revive(pane_id) and pane_id == snap.get("focused_pane_id"):
         mark_closed(tab_id)
         herdr("pane", "close", pane_id)
     else:
@@ -457,8 +503,9 @@ def find():
     pane_id = list_pane_in_tab(snap, tab_id)
     if pane_id is None:
         clear_closed(tab_id)
-        pane_id = dock(snap, tab_id)
+        pane_id = dock_once(tab_id)
     else:
+        revive(pane_id)
         rpc("pane.focus", {"pane_id": pane_id})
     if pane_id:
         herdr("pane", "send-text", pane_id, "/")
@@ -509,7 +556,11 @@ def ensure():
         except OSError:
             return
         snap = fetch_snapshot()
-        if list_pane_in_tab(snap, tab_id) or not has_room(snap, tab_id):
+        existing = list_pane_in_tab(snap, tab_id)
+        if existing:
+            revive(existing)
+            return
+        if not has_room(snap, tab_id):
             return
         if only_helpers_left(snap, tab_id):
             return
@@ -827,6 +878,9 @@ def main():
         return
     if "--find" in sys.argv[1:]:
         find()
+        return
+    if "--startup" in sys.argv[1:]:
+        revive_all()
         return
     if "--ensure" in sys.argv[1:]:
         ensure()

@@ -18,6 +18,7 @@ from spaces_list import (
     has_room,
     leftmost_pane,
     list_pane_in_tab,
+    list_process_state,
     nearest_256,
     only_helpers_left,
     opening_key,
@@ -207,6 +208,24 @@ class FocusHook(unittest.TestCase):
         self.assertTrue(only_helpers_left(snap("Spaces", "Sidebar"), "t"))
         self.assertFalse(only_helpers_left(snap("Spaces", None), "t"))
         self.assertFalse(only_helpers_left(snap(), "t"))
+
+
+class RestoredPanes(unittest.TestCase):
+    def test_list_process_counts_as_running(self):
+        procs = [{"argv0": "python3", "cmdline": "python3 spaces_list.py"}]
+        self.assertEqual(list_process_state(procs), "running")
+
+    def test_a_bare_shell_can_be_revived(self):
+        self.assertEqual(list_process_state([{"argv0": "fish", "cmdline": "fish"}]), "shell")
+        self.assertEqual(list_process_state([{"argv0": "-zsh", "cmdline": "-zsh"}]), "shell")
+        self.assertEqual(list_process_state([{"argv0": "/bin/bash"}]), "shell")
+
+    def test_anything_else_is_left_alone(self):
+        self.assertEqual(list_process_state([{"argv0": "vim", "cmdline": "vim notes"}]), "other")
+        self.assertEqual(list_process_state([{"argv0": "fish"}, {"argv0": "git"}]), "other")
+
+    def test_no_processes_yet_is_not_a_shell(self):
+        self.assertEqual(list_process_state([]), "other")
 
 
 class Theme(unittest.TestCase):

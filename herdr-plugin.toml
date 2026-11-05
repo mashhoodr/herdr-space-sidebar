@@ -23,6 +23,10 @@ title = "Spaces"
 placement = "split"
 command = ["python3", "spaces_list.py"]
 
+# Herdr restores plugin panes as plain shells after a restart, so restart them.
+[[startup]]
+command = ["python3", "spaces_list.py", "--startup"]
+
 # Moving to a tab fires these even for new tabs and spaces. pane.focused is left
 # out on purpose: docking moves focus, and that must not re-trigger the hook.
 [[events]]
