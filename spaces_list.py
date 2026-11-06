@@ -3,7 +3,7 @@
 
 Run with no arguments inside a plugin pane to draw the list, with --toggle from
 the plugin action to open, focus or close it in the current tab, or with --ensure
-from the focus hooks to open it in a tab that does not have one yet.
+from the focus hooks to bring it to the tab being focused.
 """
 import curses
 import fcntl
@@ -349,6 +349,15 @@ def opening_key(snap, own_pane, own_tab):
     return None
 
 
+def locate_self(snap, pane_id, tab_id, terminal_id):
+    """Where this list is now: a move can change its pane id, never its terminal."""
+    for pane in snap.get("panes", []):
+        found = pane.get("terminal_id") == terminal_id if terminal_id else pane.get("pane_id") == pane_id
+        if found:
+            return pane["pane_id"], pane.get("tab_id"), pane.get("terminal_id")
+    return pane_id, tab_id, terminal_id
+
+
 def leftmost_pane(snap, tab_id):
     """The pane to split when docking: the left column, topmost first."""
     for layout in snap.get("layouts", []):
@@ -541,35 +550,129 @@ def only_helpers_left(snap, tab_id):
     return bool(panes) and all(p.get("label") in HELPER_LABELS for p in panes)
 
 
+def stale_list_panes(snap, tab_id):
+    """Lists outside the active tab, unless closing one would close its whole tab."""
+    return [
+        pane["pane_id"]
+        for pane in snap.get("panes", [])
+        if pane.get("label") == LABEL
+        and pane.get("tab_id") != tab_id
+        and not only_helpers_left(snap, pane.get("tab_id"))
+    ]
+
+
+def target_path():
+    """The tab this session's focus hooks last moved to; the state dir is shared."""
+    session = os.environ.get("HERDR_SOCKET_PATH", "").replace(os.sep, "_")
+    return os.path.join(state_dir(), f"target-{session}")
+
+
+def remember_target(tab_id):
+    path = target_path()
+    temporary = f"{path}.{os.getpid()}"
+    with open(temporary, "w") as target:
+        target.write(tab_id)
+    os.replace(temporary, path)
+
+
+def latest_target(fallback):
+    try:
+        with open(target_path()) as target:
+            return target.read().strip() or fallback
+    except FileNotFoundError:
+        return fallback
+
+
+def close_lists(pane_ids):
+    closed = False
+    for pane_id in pane_ids:
+        try:
+            herdr("pane", "close", pane_id)
+            closed = True
+        except subprocess.SubprocessError:
+            pass  # Already gone; the next tab switch sweeps anything left.
+    return closed
+
+
+def move_list(snap, pane_id, tab_id):
+    """Bring a running list to a tab's left edge; returns its id, which may change.
+
+    The split starts at the final width, so the tab's panes settle in one resize
+    and the list keeps its process and what it has drawn. The move only goes
+    rightwards, so the first pane takes the narrow share until the swap.
+    """
+    target = leftmost_pane(snap, tab_id)
+    if target is None:
+        return None
+    share = min(WIDTH / max(target["rect"]["width"], 1), 0.5)
+    moved = json.loads(herdr(
+        "pane", "move", pane_id,
+        "--tab", tab_id,
+        "--split", "right",
+        "--target-pane", target["pane_id"],
+        "--ratio", f"{share:.4f}",
+        "--no-focus",
+    ))
+    new_id = moved["result"]["move_result"]["pane"]["pane_id"]
+    herdr("pane", "swap", "--source-pane", new_id, "--target-pane", target["pane_id"])
+    correct_width(tab_id, new_id)
+    return new_id
+
+
+def place_list(snap, spare, tab_id):
+    """Show the list in a tab, by moving a spare one if there is one."""
+    if spare is None:
+        return dock(snap, tab_id)
+    try:
+        return move_list(snap, spare, tab_id)
+    except (subprocess.SubprocessError, ValueError, KeyError):
+        # The move may have half worked, so look again before opening another.
+        snap = fetch_snapshot()
+        close_lists(stale_list_panes(snap, tab_id))
+        return list_pane_in_tab(snap, tab_id) or dock(snap, tab_id)
+
+
+def sync_list(tab_id):
+    """Keep one list: bring it to the tab being focused and close any others."""
+    snap = fetch_snapshot()
+    stale = stale_list_panes(snap, tab_id)
+    marked = os.path.exists(marker_path(tab_id))
+    existing = list_pane_in_tab(snap, tab_id)
+    wanted = (
+        not marked
+        and not existing
+        and has_room(snap, tab_id)
+        and not only_helpers_left(snap, tab_id)
+    )
+    spare = stale.pop(0) if wanted and stale else None
+    if close_lists(stale):
+        snap = fetch_snapshot()
+    if existing and not marked:
+        revive(existing)
+    if not wanted:
+        return
+    previous = snap.get("focused_pane_id")
+    target = leftmost_pane(snap, tab_id)
+    pane_id = place_list(snap, spare, tab_id)
+    in_tab = previous in {p["pane_id"] for p in snap["panes"] if p.get("tab_id") == tab_id}
+    if pane_id and fetch_snapshot().get("focused_pane_id") == pane_id:
+        rpc("pane.focus", {"pane_id": previous if in_tab else target["pane_id"]})
+
+
 def ensure():
-    """Focus hook: open the list in the tab being focused, keeping focus put."""
+    """Focus hook: move the single list to the tab being focused, keeping focus put."""
     snap = fetch_snapshot()
     sweep_closed_markers(snap)
     event = json.loads(os.environ.get("HERDR_PLUGIN_EVENT_JSON") or "{}")
     tab_id = event_tab(event, snap)
-    if not tab_id or os.path.exists(marker_path(tab_id)):
+    if not tab_id:
         return
+    # Record the move before queueing, so quick switches settle on the last tab
+    # rather than whichever hook happened to win the lock.
+    remember_target(tab_id)
     with open(os.path.join(state_dir(), "dock.lock"), "w") as lock:
-        # tab.focused and workspace.focused often fire together; one is enough.
-        try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
-            return
-        snap = fetch_snapshot()
-        existing = list_pane_in_tab(snap, tab_id)
-        if existing:
-            revive(existing)
-            return
-        if not has_room(snap, tab_id):
-            return
-        if only_helpers_left(snap, tab_id):
-            return
-        previous = snap.get("focused_pane_id")
-        target = leftmost_pane(snap, tab_id)
-        pane_id = dock(snap, tab_id)
-        in_tab = previous in {p["pane_id"] for p in snap["panes"] if p.get("tab_id") == tab_id}
-        if pane_id and fetch_snapshot().get("focused_pane_id") == pane_id:
-            rpc("pane.focus", {"pane_id": previous if in_tab else target["pane_id"]})
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        sync_list(latest_target(tab_id))
 
 
 def activate(row):
@@ -793,6 +896,7 @@ def run(window):
     identities, next_identities = {}, 0.0
     own_pane = os.environ.get("HERDR_PANE_ID")
     own_tab = os.environ.get("HERDR_TAB_ID")
+    own_terminal = None
     started_with = source_mtime()
     while True:
         if time.monotonic() >= next_refresh:
@@ -802,6 +906,10 @@ def run(window):
                 os.execv(sys.executable, [sys.executable] + sys.argv)
             try:
                 snap = fetch_snapshot()
+                own_pane, own_tab, own_terminal = locate_self(snap, own_pane, own_tab, own_terminal)
+                # The reload above re-runs this file with this environment.
+                if own_pane and own_tab:
+                    os.environ.update(HERDR_PANE_ID=own_pane, HERDR_TAB_ID=own_tab)
                 if only_helpers_left(snap, own_tab):
                     return
                 if time.monotonic() >= next_identities:

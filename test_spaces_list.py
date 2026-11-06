@@ -1,4 +1,9 @@
+import json
+import os
+import subprocess
+import tempfile
 import unittest
+from unittest import mock
 
 from spaces_list import (
     ONE_DARK,
@@ -26,7 +31,13 @@ from spaces_list import (
     row_at,
     scroll_top,
     source_changed,
+    stale_list_panes,
     text_width,
+    latest_target,
+    locate_self,
+    move_list,
+    remember_target,
+    sync_list,
     user_session_name,
 )
 
@@ -208,6 +219,180 @@ class FocusHook(unittest.TestCase):
         self.assertTrue(only_helpers_left(snap("Spaces", "Sidebar"), "t"))
         self.assertFalse(only_helpers_left(snap("Spaces", None), "t"))
         self.assertFalse(only_helpers_left(snap(), "t"))
+
+
+class SingleList(unittest.TestCase):
+    @staticmethod
+    def snap(*panes):
+        return {"panes": [
+            {"pane_id": pane_id, "tab_id": tab_id, "label": label}
+            for pane_id, tab_id, label in panes
+        ]}
+
+    def test_lists_in_other_tabs_are_stale(self):
+        snap = self.snap(("a1", "a", "Spaces"), ("a2", "a", None),
+                         ("b1", "b", "Spaces"), ("b2", "b", None))
+        self.assertEqual(stale_list_panes(snap, "b"), ["a1"])
+
+    def test_active_tab_and_other_panes_are_never_stale(self):
+        snap = self.snap(("a1", "a", "Spaces"), ("a2", "a", None), ("c1", "c", None))
+        self.assertEqual(stale_list_panes(snap, "a"), [])
+
+    def test_closing_must_not_take_a_whole_tab_with_it(self):
+        snap = self.snap(("a1", "a", "Spaces"), ("b1", "b", "Spaces"), ("b2", "b", "Sidebar"))
+        self.assertEqual(stale_list_panes(snap, "c"), [])
+
+    def test_latest_target_wins_and_missing_falls_back(self):
+        with tempfile.TemporaryDirectory() as state, mock.patch.dict(
+            os.environ, {"HERDR_PLUGIN_STATE_DIR": state, "HERDR_SOCKET_PATH": "/s/herdr.sock"}
+        ):
+            self.assertEqual(latest_target("fallback"), "fallback")
+            remember_target("w1:t1")
+            remember_target("w2:t3")
+            self.assertEqual(latest_target("fallback"), "w2:t3")
+
+    def test_targets_do_not_leak_between_sessions(self):
+        with tempfile.TemporaryDirectory() as state, mock.patch.dict(
+            os.environ, {"HERDR_PLUGIN_STATE_DIR": state, "HERDR_SOCKET_PATH": "/one/herdr.sock"}
+        ):
+            remember_target("w1:t1")
+            os.environ["HERDR_SOCKET_PATH"] = "/two/herdr.sock"
+            self.assertEqual(latest_target("fallback"), "fallback")
+
+
+class LocateSelf(unittest.TestCase):
+    SNAP = {"panes": [
+        {"pane_id": "w2:p2", "tab_id": "w2:t1", "terminal_id": "term_a"},
+        {"pane_id": "w1:p9", "tab_id": "w1:t1", "terminal_id": "term_b"},
+    ]}
+
+    def test_first_look_learns_the_terminal_from_the_pane_id(self):
+        self.assertEqual(locate_self(self.SNAP, "w1:p9", "w1:t1", None), ("w1:p9", "w1:t1", "term_b"))
+
+    def test_a_move_changes_pane_and_tab_but_not_the_terminal(self):
+        self.assertEqual(locate_self(self.SNAP, "w1:p2", "w1:t1", "term_a"), ("w2:p2", "w2:t1", "term_a"))
+
+    def test_a_recycled_pane_id_does_not_fool_a_known_terminal(self):
+        self.assertEqual(locate_self(self.SNAP, "w1:p9", "w1:t1", "term_a"), ("w2:p2", "w2:t1", "term_a"))
+
+    def test_not_found_keeps_what_it_knew(self):
+        self.assertEqual(locate_self(self.SNAP, "w9:p1", "w9:t1", "term_z"), ("w9:p1", "w9:t1", "term_z"))
+
+
+def move_result(pane_id):
+    return json.dumps({"result": {"move_result": {"pane": {"pane_id": pane_id}}}})
+
+
+class MoveList(unittest.TestCase):
+    SNAP = {
+        "layouts": [{"tab_id": "t2", "area": {"width": 200}, "panes": [
+            {"pane_id": "work", "rect": {"x": 0, "y": 0, "width": 160}},
+        ]}],
+    }
+
+    def test_splits_at_the_final_width_then_swaps_using_the_new_id(self):
+        with mock.patch("spaces_list.herdr", return_value=move_result("new")) as herdr, \
+                mock.patch("spaces_list.correct_width"):
+            self.assertEqual(move_list(self.SNAP, "old", "t2"), "new")
+        self.assertEqual(herdr.call_args_list, [
+            mock.call("pane", "move", "old", "--tab", "t2", "--split", "right",
+                      "--target-pane", "work", "--ratio", "0.2000", "--no-focus"),
+            mock.call("pane", "swap", "--source-pane", "new", "--target-pane", "work"),
+        ])
+
+    def test_a_narrow_target_keeps_at_least_half(self):
+        snap = {"layouts": [{"tab_id": "t2", "panes": [
+            {"pane_id": "work", "rect": {"x": 0, "y": 0, "width": 40}},
+        ]}]}
+        with mock.patch("spaces_list.herdr", return_value=move_result("new")) as herdr, \
+                mock.patch("spaces_list.correct_width"):
+            move_list(snap, "old", "t2")
+        self.assertIn("0.5000", herdr.call_args_list[0].args)
+
+    def test_no_target_means_no_move(self):
+        with mock.patch("spaces_list.herdr") as herdr:
+            self.assertIsNone(move_list({"layouts": []}, "old", "t2"))
+        herdr.assert_not_called()
+
+
+class SyncList(unittest.TestCase):
+    @staticmethod
+    def snap(*panes, focused="a2", zoomed=False, width=180):
+        tabs = {tab for _, tab, _ in panes}
+        return {
+            "focused_pane_id": focused,
+            "panes": [{"pane_id": p, "tab_id": t, "label": l} for p, t, l in panes],
+            "layouts": [{
+                "tab_id": tab, "zoomed": zoomed, "area": {"width": width},
+                "panes": [{"pane_id": p, "rect": {"x": 0, "y": 0, "width": width}}
+                          for p, t, l in panes if t == tab],
+            } for tab in tabs],
+        }
+
+    def run_sync(self, snap, tab="b", move=None, closed_marker=False):
+        with tempfile.TemporaryDirectory() as state, mock.patch.dict(
+            os.environ, {"HERDR_PLUGIN_STATE_DIR": state}
+        ), mock.patch("spaces_list.fetch_snapshot", return_value=snap), \
+                mock.patch("spaces_list.herdr") as herdr, \
+                mock.patch("spaces_list.rpc") as rpc, \
+                mock.patch("spaces_list.revive") as revive, \
+                mock.patch("spaces_list.dock", return_value="docked") as dock, \
+                mock.patch("spaces_list.move_list", move or mock.Mock(return_value="moved")) as moved:
+            if closed_marker:
+                open(os.path.join(state, f"closed-{tab}"), "w").close()
+            sync_list(tab)
+        return mock.Mock(herdr=herdr, rpc=rpc, revive=revive, dock=dock, move=moved)
+
+    @staticmethod
+    def closed(result):
+        return [c.args[2] for c in result.herdr.call_args_list if c.args[:2] == ("pane", "close")]
+
+    def test_moves_the_running_list_instead_of_opening_one(self):
+        result = self.run_sync(self.snap(("a1", "a", "Spaces"), ("a2", "a", None), ("b1", "b", None)))
+        self.assertEqual(result.move.call_args.args[1:], ("a1", "b"))
+        result.dock.assert_not_called()
+        self.assertEqual(self.closed(result), [])
+
+    def test_extra_lists_are_closed_and_one_is_moved(self):
+        result = self.run_sync(self.snap(("a1", "a", "Spaces"), ("a2", "a", None),
+                                         ("c1", "c", "Spaces"), ("c2", "c", None), ("b1", "b", None)))
+        self.assertEqual(result.move.call_args.args[1:], ("a1", "b"))
+        self.assertEqual(self.closed(result), ["c1"])
+
+    def test_no_list_anywhere_opens_one(self):
+        result = self.run_sync(self.snap(("a2", "a", None), ("b1", "b", None)))
+        result.move.assert_not_called()
+        result.dock.assert_called_once()
+
+    def test_a_list_already_here_stays_and_others_close(self):
+        result = self.run_sync(self.snap(("a1", "a", "Spaces"), ("a2", "a", None),
+                                         ("b0", "b", "Spaces"), ("b1", "b", None)))
+        result.move.assert_not_called()
+        result.revive.assert_called_once_with("b0")
+        self.assertEqual(self.closed(result), ["a1"])
+
+    def test_a_tab_closed_with_q_gets_no_list(self):
+        result = self.run_sync(self.snap(("a1", "a", "Spaces"), ("a2", "a", None), ("b1", "b", None)),
+                               closed_marker=True)
+        result.move.assert_not_called()
+        result.dock.assert_not_called()
+        self.assertEqual(self.closed(result), ["a1"])
+
+    def test_a_narrow_tab_gets_no_list(self):
+        result = self.run_sync(self.snap(("a1", "a", "Spaces"), ("a2", "a", None), ("b1", "b", None), width=80))
+        result.move.assert_not_called()
+        self.assertEqual(self.closed(result), ["a1"])
+
+    def test_a_failed_move_falls_back_to_opening_one(self):
+        failing = mock.Mock(side_effect=subprocess.CalledProcessError(1, "herdr"))
+        result = self.run_sync(self.snap(("a1", "a", "Spaces"), ("a2", "a", None), ("b1", "b", None)), move=failing)
+        self.assertEqual(self.closed(result), ["a1"])
+        result.dock.assert_called_once()
+
+    def test_focus_returns_to_work_when_the_swap_took_it(self):
+        snap = self.snap(("a1", "a", "Spaces"), ("a2", "a", None), ("b1", "b", None), focused="moved")
+        result = self.run_sync(snap)
+        result.rpc.assert_called_once_with("pane.focus", {"pane_id": "b1"})
 
 
 class RestoredPanes(unittest.TestCase):

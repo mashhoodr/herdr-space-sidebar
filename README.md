@@ -51,7 +51,7 @@ sidebar_collapsed_mode = "hidden"
 | `prefix+a` | Open, focus, or close the list |
 
 - Find matches every word you type against the session name, agent, title, status, tab, folder and space, so `docs blocked` works. Panes without an agent aren't listed.
-- The list opens by itself when you move to a tab that doesn't have one, and focus stays on your work.
+- One list follows you: it moves to the tab you switch to, and focus stays on your work. Other tabs use their full width until you visit them.
 - Spaces that need you sort to the top: blocked first, then done. Set `SORT_BY_ATTENTION = False` in `spaces_list.py` to keep herdr's order.
 - With herdr's `one-dark` theme, the list uses that theme's colors. Other themes use your terminal's palette.
 - The highlight follows the focused pane, except while the list itself has focus.
@@ -59,10 +59,11 @@ sidebar_collapsed_mode = "hidden"
 
 ## Known limitations
 
+- Switching tabs causes a brief flicker of about 60 ms. Herdr draws a tab before telling plugins about the switch, so the tab appears at full width, narrows when the list arrives, and then its agent repaints at the new width. A faster hook only shortens this. Avoiding it would need a placeholder column in every tab so the layout never changes.
 - Closing a tab may not open the list in the tab you land on until you next switch to it.
 - Closing the list with `prefix+x` brings it back on your next visit to that tab. Use `q` or the toggle instead.
+- `q` keeps the list closed by tab ID, and tab IDs repeat across herdr sessions, so it can also keep the list closed in another session's tab with the same ID.
 - A tab whose left column is already split gives the list only the top slot.
-- Switching tabs very quickly can leave one without a list until you next visit it.
 
 ## Develop
 
