@@ -21,7 +21,6 @@ from spaces_list import (
     first_match,
     followed_key,
     has_room,
-    leftmost_pane,
     list_pane_in_tab,
     list_process_state,
     nearest_256,
@@ -37,6 +36,7 @@ from spaces_list import (
     locate_self,
     move_list,
     remember_target,
+    rightmost_pane,
     sync_list,
     user_session_name,
 )
@@ -290,14 +290,14 @@ class MoveList(unittest.TestCase):
         ]}],
     }
 
-    def test_splits_at_the_final_width_then_swaps_using_the_new_id(self):
+    def test_splits_at_the_final_width_and_returns_the_new_id(self):
         with mock.patch("spaces_list.herdr", return_value=move_result("new")) as herdr, \
                 mock.patch("spaces_list.correct_width"):
             self.assertEqual(move_list(self.SNAP, "old", "t2"), "new")
         self.assertEqual(herdr.call_args_list, [
             mock.call("pane", "move", "old", "--tab", "t2", "--split", "right",
-                      "--target-pane", "work", "--ratio", "0.2000", "--no-focus"),
-            mock.call("pane", "swap", "--source-pane", "new", "--target-pane", "work"),
+                      "--target-pane", "work", "--ratio", "0.8000", "--no-focus"),
+            mock.call("pane", "resize", "--pane", "new", "--direction", "right", "--amount", "0.0001"),
         ])
 
     def test_a_narrow_target_keeps_at_least_half(self):
@@ -389,7 +389,7 @@ class SyncList(unittest.TestCase):
         self.assertEqual(self.closed(result), ["a1"])
         result.dock.assert_called_once()
 
-    def test_focus_returns_to_work_when_the_swap_took_it(self):
+    def test_focus_returns_to_work_if_the_list_took_it(self):
         snap = self.snap(("a1", "a", "Spaces"), ("a2", "a", None), ("b1", "b", None), focused="moved")
         result = self.run_sync(snap)
         result.rpc.assert_called_once_with("pane.focus", {"pane_id": "b1"})
@@ -541,11 +541,19 @@ class Spacing(unittest.TestCase):
 
 
 class Layout(unittest.TestCase):
-    def test_leftmost_pane_prefers_topmost_of_the_left_column(self):
-        self.assertEqual(leftmost_pane(snapshot(), "w1:t1")["pane_id"], "w1:p1")
+    def test_rightmost_pane_is_at_the_right_edge(self):
+        self.assertEqual(rightmost_pane(snapshot(), "w1:t1")["pane_id"], "w1:p2")
 
-    def test_leftmost_pane_none_for_unknown_tab(self):
-        self.assertIsNone(leftmost_pane(snapshot(), "w9:t1"))
+    def test_rightmost_pane_prefers_topmost_of_the_right_column(self):
+        snap = {"layouts": [{"tab_id": "t", "panes": [
+            {"pane_id": "left", "rect": {"x": 0, "y": 0, "width": 50}},
+            {"pane_id": "lower", "rect": {"x": 50, "y": 20, "width": 50}},
+            {"pane_id": "upper", "rect": {"x": 50, "y": 0, "width": 50}},
+        ]}]}
+        self.assertEqual(rightmost_pane(snap, "t")["pane_id"], "upper")
+
+    def test_rightmost_pane_none_for_unknown_tab(self):
+        self.assertIsNone(rightmost_pane(snapshot(), "w9:t1"))
 
     def test_list_pane_found_by_label_within_the_tab(self):
         self.assertEqual(list_pane_in_tab(snapshot(), "w1:t1"), "w1:p9")

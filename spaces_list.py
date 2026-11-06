@@ -358,11 +358,11 @@ def locate_self(snap, pane_id, tab_id, terminal_id):
     return pane_id, tab_id, terminal_id
 
 
-def leftmost_pane(snap, tab_id):
-    """The pane to split when docking: the left column, topmost first."""
+def rightmost_pane(snap, tab_id):
+    """The pane to split when docking: the right column, topmost first."""
     for layout in snap.get("layouts", []):
         if layout.get("tab_id") == tab_id and layout.get("panes"):
-            return min(layout["panes"], key=lambda p: (p["rect"]["x"], p["rect"]["y"]))
+            return min(layout["panes"], key=lambda p: (-(p["rect"]["x"] + p["rect"]["width"]), p["rect"]["y"]))
     return None
 
 
@@ -410,12 +410,12 @@ def revive_all():
 
 
 def dock(snap, tab_id):
-    """Open the list at the left edge of a tab and size it to WIDTH columns.
+    """Open the list at the right edge of a tab and size it to WIDTH columns.
 
-    The swap below moves focus to the new pane, so callers that want focus
-    elsewhere must set it again afterwards.
+    Opening moves focus to the new pane, so callers that want focus elsewhere
+    must set it again afterwards.
     """
-    target = leftmost_pane(snap, tab_id)
+    target = rightmost_pane(snap, tab_id)
     if target is None:
         return None
     opened = json.loads(herdr(
@@ -427,10 +427,8 @@ def dock(snap, tab_id):
         "--direction", "right",
     ))
     pane_id = opened["result"]["plugin_pane"]["pane"]["pane_id"]
-    # Herdr only splits rightwards here, so swap to reach the left edge.
-    herdr("pane", "swap", "--source-pane", pane_id, "--target-pane", target["pane_id"])
     share = WIDTH / max(target["rect"]["width"], 1)
-    herdr("pane", "resize", "--pane", pane_id, "--direction", "left",
+    herdr("pane", "resize", "--pane", pane_id, "--direction", "right",
           "--amount", f"{max(0.5 - share, 0.0):.4f}")
     correct_width(tab_id, pane_id)
     return pane_id
@@ -445,7 +443,7 @@ def correct_width(tab_id, pane_id):
         off_by = width - WIDTH
         if abs(off_by) > 2:
             herdr("pane", "resize", "--pane", pane_id,
-                  "--direction", "left" if off_by > 0 else "right",
+                  "--direction", "right" if off_by > 0 else "left",
                   "--amount", f"{abs(off_by) / layout['area']['width']:.4f}")
 
 
@@ -595,16 +593,15 @@ def close_lists(pane_ids):
 
 
 def move_list(snap, pane_id, tab_id):
-    """Bring a running list to a tab's left edge; returns its id, which may change.
+    """Bring a running list to a tab's right edge; returns its id, which may change.
 
     The split starts at the final width, so the tab's panes settle in one resize
-    and the list keeps its process and what it has drawn. The move only goes
-    rightwards, so the first pane takes the narrow share until the swap.
+    and the list keeps its process and what it has drawn.
     """
-    target = leftmost_pane(snap, tab_id)
+    target = rightmost_pane(snap, tab_id)
     if target is None:
         return None
-    share = min(WIDTH / max(target["rect"]["width"], 1), 0.5)
+    share = max(1 - WIDTH / max(target["rect"]["width"], 1), 0.5)
     moved = json.loads(herdr(
         "pane", "move", pane_id,
         "--tab", tab_id,
@@ -614,7 +611,9 @@ def move_list(snap, pane_id, tab_id):
         "--no-focus",
     ))
     new_id = moved["result"]["move_result"]["pane"]["pane_id"]
-    herdr("pane", "swap", "--source-pane", new_id, "--target-pane", target["pane_id"])
+    # A move changes the layout without telling the panes, so an agent would keep
+    # drawing at its old width. Any resize makes herdr deliver the new size.
+    herdr("pane", "resize", "--pane", new_id, "--direction", "right", "--amount", "0.0001")
     correct_width(tab_id, new_id)
     return new_id
 
@@ -652,7 +651,7 @@ def sync_list(tab_id):
     if not wanted:
         return
     previous = snap.get("focused_pane_id")
-    target = leftmost_pane(snap, tab_id)
+    target = rightmost_pane(snap, tab_id)
     pane_id = place_list(snap, spare, tab_id)
     in_tab = previous in {p["pane_id"] for p in snap["panes"] if p.get("tab_id") == tab_id}
     if pane_id and fetch_snapshot().get("focused_pane_id") == pane_id:

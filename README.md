@@ -59,11 +59,11 @@ sidebar_collapsed_mode = "hidden"
 
 ## Known limitations
 
-- Switching tabs causes a brief flicker of about 60 ms. Herdr draws a tab before telling plugins about the switch, so the tab appears at full width, narrows when the list arrives, and then its agent repaints at the new width. A faster hook only shortens this. Avoiding it would need a placeholder column in every tab so the layout never changes.
+- Switching tabs causes a brief flicker of about 60 ms. Herdr draws a tab before telling plugins about the switch, so the tab appears at full width, then narrows when the list arrives and its agent repaints at the new width. A faster hook only shortens this. Avoiding it would need a placeholder column in every tab so the layout never changes.
 - Closing a tab may not open the list in the tab you land on until you next switch to it.
 - Closing the list with `prefix+x` brings it back on your next visit to that tab. Use `q` or the toggle instead.
 - `q` keeps the list closed by tab ID, and tab IDs repeat across herdr sessions, so it can also keep the list closed in another session's tab with the same ID.
-- A tab whose left column is already split gives the list only the top slot.
+- A tab whose right column is already split gives the list only the top slot.
 
 ## Develop
 
