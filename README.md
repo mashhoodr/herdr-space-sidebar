@@ -52,6 +52,7 @@ sidebar_collapsed_mode = "hidden"
 
 - Find matches every word you type against the session name, agent, title, status, tab, folder and space, so `docs blocked` works. Panes without an agent aren't listed.
 - One list follows you: it moves to the tab you switch to, and focus stays on your work. Other tabs use their full width until you visit them.
+- While any [herdr-sidebar](https://github.com/alexarthurs/herdr-sidebar) pane is open in a tab (file tree, source control, preview or editor), the list stays out of that tab so your files get the width. It comes back when the last one closes.
 - Spaces that need you sort to the top: blocked first, then done. Set `SORT_BY_ATTENTION = False` in `spaces_list.py` to keep herdr's order.
 - With herdr's `one-dark` theme, the list uses that theme's colors. Other themes use your terminal's palette.
 - The highlight follows the focused pane, except while the list itself has focus.

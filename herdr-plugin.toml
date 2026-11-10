@@ -36,3 +36,12 @@ command = ["python3", "spaces_list.py", "--ensure"]
 [[events]]
 on = "workspace.focused"
 command = ["python3", "spaces_list.py", "--ensure"]
+
+# Step aside while a herdr-sidebar file preview is open, and come back after.
+[[events]]
+on = "pane.created"
+command = ["python3", "spaces_list.py", "--pane-changed"]
+
+[[events]]
+on = "pane.closed"
+command = ["python3", "spaces_list.py", "--pane-changed"]

@@ -1,3 +1,4 @@
+import itertools
 import json
 import os
 import subprocess
@@ -21,6 +22,8 @@ from spaces_list import (
     first_match,
     followed_key,
     has_room,
+    is_preview,
+    pane_changed,
     list_pane_in_tab,
     list_process_state,
     nearest_256,
@@ -393,6 +396,82 @@ class SyncList(unittest.TestCase):
         snap = self.snap(("a1", "a", "Spaces"), ("a2", "a", None), ("b1", "b", None), focused="moved")
         result = self.run_sync(snap)
         result.rpc.assert_called_once_with("pane.focus", {"pane_id": "b1"})
+
+    def test_a_tab_with_a_preview_gets_no_list(self):
+        result = self.run_sync(self.snap(("a1", "a", "Spaces"), ("a2", "a", None),
+                                         ("b1", "b", None), ("b2", "b", "notes.md · preview")))
+        result.move.assert_not_called()
+        result.dock.assert_not_called()
+        self.assertEqual(self.closed(result), ["a1"])
+
+
+class Preview(unittest.TestCase):
+    def test_previews_are_known_by_token_or_name(self):
+        self.assertTrue(is_preview({"label": "notes.md", "tokens": {"herdr-sidebar-preview": "1"}}))
+        self.assertTrue(is_preview({"label": "notes.md · preview"}))
+        self.assertTrue(is_preview({"label": "main.rs · editor"}))
+        self.assertTrue(is_preview({"label": "Sidebar", "tokens": {"herdr-sidebar-explorer": "1"}}))
+        self.assertTrue(is_preview({"label": "Source Control"}))
+        self.assertFalse(is_preview({"label": "herdr-dashboard"}))
+        self.assertFalse(is_preview({"label": "Spaces"}))
+        self.assertFalse(is_preview({}))
+
+    def run_event(self, event, snaps, aside=None, closed=None):
+        with tempfile.TemporaryDirectory() as state, mock.patch.dict(os.environ, {
+            "HERDR_PLUGIN_STATE_DIR": state, "HERDR_PLUGIN_EVENT_JSON": json.dumps(event),
+        }), mock.patch("spaces_list.fetch_snapshot", side_effect=snaps), \
+                mock.patch("spaces_list.time.sleep"), \
+                mock.patch("spaces_list.time.monotonic", side_effect=itertools.count(0, 0.5)), \
+                mock.patch("spaces_list.herdr") as herdr, \
+                mock.patch("spaces_list.sync_list") as sync:
+            for kind, tab in (("aside", aside), ("closed", closed)):
+                if tab:
+                    open(os.path.join(state, f"{kind}-{tab}"), "w").close()
+            pane_changed()
+            remaining = sorted(os.listdir(state))
+        return mock.Mock(herdr=herdr, sync=sync, markers=remaining)
+
+    @staticmethod
+    def snap(*panes, focused_tab="b"):
+        return {"focused_tab_id": focused_tab,
+                "panes": [{"pane_id": p, "tab_id": "b", "label": l} for p, l in panes]}
+
+    def created(self, pane_id):
+        return {"event": "pane_created", "data": {"type": "pane_created", "pane": {"pane_id": pane_id}}}
+
+    def test_a_new_preview_closes_the_list_and_remembers_why(self):
+        unnamed = self.snap(("b1", None), ("b0", "Spaces"), ("b2", None))
+        named = self.snap(("b1", None), ("b0", "Spaces"), ("b2", "notes.md · preview"))
+        result = self.run_event(self.created("b2"), [unnamed, named, named])
+        result.herdr.assert_called_once_with("pane", "close", "b0")
+        self.assertIn("aside-b", result.markers)
+
+    def test_a_pane_that_never_becomes_a_preview_is_left_alone(self):
+        plain = self.snap(("b1", None), ("b0", "Spaces"), ("b2", None))
+        result = self.run_event(self.created("b2"), [plain] * 100)
+        result.herdr.assert_not_called()
+
+    def test_a_list_closed_with_q_stays_closed_when_a_preview_opens(self):
+        named = self.snap(("b1", None), ("b0", "Spaces"), ("b2", "notes.md · preview"))
+        result = self.run_event(self.created("b2"), [named] * 3, closed="b")
+        result.herdr.assert_not_called()
+
+    def test_closing_the_preview_brings_the_list_back(self):
+        closed = {"event": "pane_closed", "data": {"type": "pane_closed", "pane_id": "b2"}}
+        after = self.snap(("b1", None))
+        result = self.run_event(closed, [after, after], aside="b")
+        result.sync.assert_called_once_with("b")
+
+    def test_closing_a_pane_elsewhere_does_nothing(self):
+        closed = {"event": "pane_closed", "data": {"type": "pane_closed", "pane_id": "b2"}}
+        result = self.run_event(closed, [self.snap(("b1", None))])
+        result.sync.assert_not_called()
+
+    def test_closing_one_of_two_previews_keeps_the_list_away(self):
+        closed = {"event": "pane_closed", "data": {"type": "pane_closed", "pane_id": "b2"}}
+        after = self.snap(("b1", None), ("b3", "other.md · preview"))
+        result = self.run_event(closed, [after, after], aside="b")
+        result.sync.assert_not_called()
 
 
 class RestoredPanes(unittest.TestCase):

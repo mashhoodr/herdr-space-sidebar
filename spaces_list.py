@@ -25,6 +25,14 @@ HELPER_LABELS = (LABEL, "Sidebar")
 SHELLS = ("fish", "zsh", "bash", "sh", "dash", "ksh")
 MIN_TAB_WIDTH = 100
 WIDTH = 32
+# herdr-sidebar's panes: file tree, source control, preview and editor. The list
+# steps aside while one is open in a tab, since files need the width more.
+PREVIEW_TOKENS = ("herdr-sidebar-preview", "herdr-sidebar-explorer", "herdr-sidebar-git")
+PREVIEW_LABELS = ("Preview", "Sidebar", "Source Control")
+PREVIEW_PREFIXES = ("Preview · ", "Editor · ")
+PREVIEW_SUFFIXES = (" · preview", " · editor")
+# A new pane has no name or tokens yet; the viewer adds them once it starts.
+PREVIEW_WAIT_SECONDS = 2.0
 PAD_X = 1
 PAD_Y = 1
 FOOTER_LINES = 2
@@ -455,9 +463,22 @@ def state_dir():
     return path
 
 
-def marker_path(tab_id):
-    """Marks a tab whose list the user closed, so the hooks leave it closed."""
-    return os.path.join(state_dir(), f"closed-{tab_id.replace(':', '_')}")
+def marker_path(tab_id, kind="closed"):
+    """Marks a tab: "closed" when the user closed its list, so the hooks leave it
+    closed; "aside" when the list made way for a preview and should come back."""
+    return os.path.join(state_dir(), f"{kind}-{tab_id.replace(':', '_')}")
+
+
+def mark_aside(tab_id):
+    with open(marker_path(tab_id, "aside"), "w"):
+        pass
+
+
+def clear_aside(tab_id):
+    try:
+        os.remove(marker_path(tab_id, "aside"))
+    except FileNotFoundError:
+        pass
 
 
 def mark_closed(tab_id):
@@ -475,10 +496,11 @@ def clear_closed(tab_id):
 
 def sweep_closed_markers(snap):
     """Tab ids get recycled, so forget markers for tabs that no longer exist."""
-    live = {marker_path(t["tab_id"]) for t in snap.get("tabs", [])}
-    for path in glob.glob(os.path.join(state_dir(), "closed-*")):
-        if path not in live:
-            os.remove(path)
+    for kind in ("closed", "aside"):
+        live = {marker_path(t["tab_id"], kind) for t in snap.get("tabs", [])}
+        for path in glob.glob(os.path.join(state_dir(), f"{kind}-*")):
+            if path not in live:
+                os.remove(path)
 
 
 def dock_once(tab_id):
@@ -540,6 +562,21 @@ def has_room(snap, tab_id):
                 and layout.get("area", {}).get("width", 0) >= MIN_TAB_WIDTH
             )
     return False
+
+
+def is_preview(pane):
+    label = pane.get("label") or ""
+    tokens = pane.get("tokens") or {}
+    return (
+        any(token in tokens for token in PREVIEW_TOKENS)
+        or label in PREVIEW_LABELS
+        or label.startswith(PREVIEW_PREFIXES)
+        or label.endswith(PREVIEW_SUFFIXES)
+    )
+
+
+def has_preview(snap, tab_id):
+    return any(p.get("tab_id") == tab_id and is_preview(p) for p in snap.get("panes", []))
 
 
 def only_helpers_left(snap, tab_id):
@@ -637,9 +674,15 @@ def sync_list(tab_id):
     stale = stale_list_panes(snap, tab_id)
     marked = os.path.exists(marker_path(tab_id))
     existing = list_pane_in_tab(snap, tab_id)
+    preview = has_preview(snap, tab_id)
+    if preview and not existing:
+        mark_aside(tab_id)  # So closing the preview brings the list back.
+    elif not preview:
+        clear_aside(tab_id)
     wanted = (
         not marked
         and not existing
+        and not preview
         and has_room(snap, tab_id)
         and not only_helpers_left(snap, tab_id)
     )
@@ -672,6 +715,49 @@ def ensure():
     with open(os.path.join(state_dir(), "dock.lock"), "w") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         sync_list(latest_target(tab_id))
+
+
+def wait_for_preview(pane_id, wait=PREVIEW_WAIT_SECONDS):
+    """The tab of a new pane once it shows itself to be a preview, else None."""
+    deadline = time.monotonic() + wait
+    while True:
+        pane = next((p for p in fetch_snapshot().get("panes", []) if p.get("pane_id") == pane_id), None)
+        if pane is None or pane.get("label") == LABEL:
+            return None
+        if is_preview(pane):
+            return pane.get("tab_id")
+        if time.monotonic() >= deadline:
+            return None
+        time.sleep(0.1)
+
+
+def step_aside(tab_id):
+    """Close the list in a tab where a preview just opened, and remember why."""
+    with open(os.path.join(state_dir(), "dock.lock"), "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        snap = fetch_snapshot()
+        existing = list_pane_in_tab(snap, tab_id)
+        if existing and not os.path.exists(marker_path(tab_id)):
+            mark_aside(tab_id)
+            close_lists([existing])
+
+
+def pane_changed():
+    """Pane hook: make way for a preview as it opens, and come back once it closes."""
+    event = json.loads(os.environ.get("HERDR_PLUGIN_EVENT_JSON") or "{}")
+    data = event.get("data", event)
+    if data.get("type") == "pane_created":
+        tab_id = wait_for_preview((data.get("pane") or {}).get("pane_id"))
+        if tab_id:
+            step_aside(tab_id)
+        return
+    tab_id = fetch_snapshot().get("focused_tab_id")
+    if not tab_id or not os.path.exists(marker_path(tab_id, "aside")):
+        return
+    with open(os.path.join(state_dir(), "dock.lock"), "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if not has_preview(fetch_snapshot(), tab_id):
+            sync_list(tab_id)
 
 
 def activate(row):
@@ -991,6 +1077,9 @@ def main():
         return
     if "--ensure" in sys.argv[1:]:
         ensure()
+        return
+    if "--pane-changed" in sys.argv[1:]:
+        pane_changed()
         return
     curses.wrapper(run)
 
