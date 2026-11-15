@@ -7,6 +7,7 @@ import unittest
 from unittest import mock
 
 from spaces_list import (
+    agent_kind_tag,
     ONE_DARK,
     PAD_Y,
     agent_text,
@@ -104,14 +105,21 @@ class BuildRows(unittest.TestCase):
 
     def test_tab_number_is_a_separate_detail_only_with_several_tabs(self):
         rows = {r["target"]: r for r in build_rows(snapshot())}
-        self.assertEqual(rows["w1:p1"]["text"], "claude · test")
+        self.assertEqual(rows["w1:p1"]["text"], "test")
         self.assertEqual(rows["w1:p1"]["detail"], "")
-        self.assertEqual(rows["w3:p3"]["text"], "claude · later tab")
+        self.assertEqual(rows["w3:p3"]["text"], "later tab")
         self.assertEqual(rows["w3:p3"]["detail"], "t2")
 
     def test_title_matching_agent_name_is_not_repeated(self):
         rows = {r["target"]: r["text"] for r in build_rows(snapshot())}
         self.assertEqual(rows["w3:p1"], "codex")
+
+    def test_agent_kind_is_a_right_tag_only_for_non_default_agents(self):
+        rows = {r["target"]: r for r in build_rows(snapshot())}
+        self.assertNotIn("claude", rows["w1:p1"]["detail"])
+        self.assertTrue(rows["w3:p1"]["detail"].startswith("codex"))
+        self.assertEqual(agent_kind_tag({"agent": "gemini"}), "gemini")
+        self.assertEqual(agent_kind_tag({"agent": "claude"}), "")
 
     def test_filler_title_is_hidden(self):
         agent = {"agent": "claude", "terminal_title_stripped": "Claude Code"}
@@ -165,7 +173,7 @@ class SessionIdentity(unittest.TestCase):
     def test_color_without_a_name_keeps_the_default_text(self):
         identities = {"w1:p1": {"name": None, "color": "green"}}
         rows = {r["target"]: r for r in build_rows(snapshot(), identities)}
-        self.assertEqual(rows["w1:p1"]["text"], "claude · test")
+        self.assertEqual(rows["w1:p1"]["text"], "test")
         self.assertEqual(rows["w1:p1"]["color"], "green")
 
     def test_agents_without_identity_have_no_color(self):

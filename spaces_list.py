@@ -220,14 +220,26 @@ def refresh_identities(snap, identities):
             identities[pane_id] = identity
 
 
+# The agent most panes run. Its kind isn't shown; any other kind gets a tag on the right.
+DEFAULT_AGENT = "claude"
+
+
 def agent_text(agent, session_name=None):
+    """The row's name: the session name, else the terminal title (Claude sets it to the session
+    name), else the pane label or agent kind. The kind is never a prefix: see agent_kind_tag."""
     if session_name:
         return session_name
     name = agent.get("label") or agent.get("agent") or "agent"
     title = agent.get("terminal_title_stripped") or ""
     if title in ("", name) or title.lower() in FILLER_TITLES:
         return name
-    return f"{name} · {title}"
+    return title
+
+
+def agent_kind_tag(agent):
+    """Right-hand tag naming the agent kind, only when it isn't the default (claude)."""
+    kind = agent.get("agent") or ""
+    return "" if kind in ("", DEFAULT_AGENT) else kind
 
 
 def attention_sorted(spaces):
@@ -351,7 +363,7 @@ def build_rows(snap, identities=None):
                 "search": agent_search_text(
                     agent, text, tab_labels.get(agent.get("tab_id")), space.get("label")
                 ),
-                "detail": f"t{number}" if number else "",
+                "detail": " ".join(x for x in (agent_kind_tag(agent), f"t{number}" if number else "") if x),
                 "color": identity.get("color"),
                 "current": agent["pane_id"] == focused_pane,
             })
