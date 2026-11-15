@@ -472,24 +472,50 @@ def dock(snap, tab_id):
         "--direction", "right",
     ))
     pane_id = opened["result"]["plugin_pane"]["pane"]["pane_id"]
-    share = WIDTH / max(target["rect"]["width"], 1)
-    herdr("pane", "resize", "--pane", pane_id, "--direction", "right",
-          "--amount", f"{max(0.5 - share, 0.0):.4f}")
     correct_width(tab_id, pane_id)
     return pane_id
 
 
-def correct_width(tab_id, pane_id):
-    """Another plugin may have split the tab meanwhile, skewing the first resize."""
+def correct_width(tab_id, pane_id, attempts=3):
+    """Bring the list to WIDTH columns.
+
+    herdr scales a resize by the split it acts on, not the whole tab, so a single
+    step can land short; repeat until the list is within two columns.
+    """
+    for _ in range(attempts):
+        if not _correct_width_once(tab_id, pane_id):
+            return
+
+
+def _correct_width_once(tab_id, pane_id):
+    """One resize step toward WIDTH; False once there's nothing left to do.
+
+    At the right edge the list's own border moves. In the middle of a row (docked
+    left of a narrow pane) herdr would move the border on the wrong side, so the
+    pane to its left is resized instead and the narrow pane keeps its width.
+    """
     for layout in fetch_snapshot().get("layouts", []):
         if layout.get("tab_id") != tab_id:
             continue
-        width = next((p["rect"]["width"] for p in layout["panes"] if p["pane_id"] == pane_id), WIDTH)
-        off_by = width - WIDTH
-        if abs(off_by) > 2:
+        rects = {p["pane_id"]: p["rect"] for p in layout["panes"]}
+        mine = rects.get(pane_id)
+        if mine is None:
+            return False
+        off_by = mine["width"] - WIDTH
+        if abs(off_by) <= 2:
+            return False
+        amount = f"{abs(off_by) / layout['area']['width']:.4f}"
+        right_edge = max(r["x"] + r["width"] for r in rects.values())
+        left = [i for i, r in rects.items() if r["x"] + r["width"] == mine["x"]
+                and r["y"] <= mine["y"] < r["y"] + r.get("height", 10**6)]
+        if mine["x"] + mine["width"] < right_edge and left:
+            herdr("pane", "resize", "--pane", left[0],
+                  "--direction", "right" if off_by > 0 else "left", "--amount", amount)
+        else:
             herdr("pane", "resize", "--pane", pane_id,
-                  "--direction", "right" if off_by > 0 else "left",
-                  "--amount", f"{abs(off_by) / layout['area']['width']:.4f}")
+                  "--direction", "right" if off_by > 0 else "left", "--amount", amount)
+        return True
+    return False
 
 
 def state_dir():

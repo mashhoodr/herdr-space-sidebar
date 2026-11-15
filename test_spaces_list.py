@@ -38,6 +38,7 @@ from spaces_list import (
     latest_target,
     locate_self,
     move_list,
+    correct_width,
     remember_target,
     rightmost_pane,
     sync_list,
@@ -354,6 +355,29 @@ class DockTarget(unittest.TestCase):
     def test_a_narrow_tab_with_one_column_still_docks(self):
         snap = self.snap(("only", 0, 0, 80))
         self.assertEqual(rightmost_pane(snap, "t")["pane_id"], "only")
+
+
+class CorrectWidth(unittest.TestCase):
+    @staticmethod
+    def snap(*panes):
+        return {"layouts": [{"tab_id": "t", "area": {"width": 224}, "panes": [
+            {"pane_id": i, "rect": {"x": x, "y": 0, "width": w, "height": 60}} for i, x, w in panes]}]}
+
+    def run_correct(self, snap, pane):
+        with mock.patch("spaces_list.fetch_snapshot", return_value=snap), \
+                mock.patch("spaces_list.herdr") as herdr:
+            correct_width("t", pane, attempts=1)
+        return herdr
+
+    def test_at_the_right_edge_the_list_resizes_itself(self):
+        herdr = self.run_correct(self.snap(("agent", 0, 112), ("list", 112, 112)), "list")
+        herdr.assert_called_once_with("pane", "resize", "--pane", "list", "--direction", "right",
+                                      "--amount", f"{80 / 224:.4f}")
+
+    def test_mid_row_the_left_neighbour_resizes_so_the_dashboard_keeps_its_width(self):
+        herdr = self.run_correct(self.snap(("agent", 0, 95), ("list", 95, 95), ("dash", 190, 34)), "list")
+        herdr.assert_called_once_with("pane", "resize", "--pane", "agent", "--direction", "right",
+                                      "--amount", f"{63 / 224:.4f}")
 
 
 class SyncList(unittest.TestCase):
