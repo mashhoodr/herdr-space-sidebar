@@ -164,8 +164,33 @@ def read_transcript_identity(path):
     return identity
 
 
-def claude_identity(pane_id):
-    """Pane -> Claude process -> session file -> transcript name and colour."""
+def transcript_identity(claude_dir, session_id, session=None):
+    # No transcript exists until a session's first message.
+    pattern = os.path.join(claude_dir, "projects", "*", f"{session_id}.jsonl")
+    matches = glob.glob(pattern)
+    identity = read_transcript_identity(matches[0]) if matches else {"name": None, "color": None}
+    if session:
+        identity["name"] = user_session_name(session) or identity["name"]
+    return identity
+
+
+def reported_session_id(agent):
+    """The session id herdr's Claude integration reported for this pane, if any."""
+    ref = agent.get("agent_session") or {}
+    return ref.get("value") if ref.get("kind") == "id" else None
+
+
+def claude_identity(pane_id, agent=None):
+    """Pane -> Claude session -> transcript name and colour.
+
+    Prefer the session id herdr already knows: it works when Claude runs inside a sandbox
+    (Fence/bubblewrap), where the pane's foreground process is the wrapper and Claude's pid
+    is namespaced. Fall back to the process -> ~/.claude/sessions/<pid>.json route.
+    """
+    claude_dir = os.path.expanduser("~/.claude")
+    session_id = reported_session_id(agent or {})
+    if session_id:
+        return transcript_identity(claude_dir, session_id)
     info = rpc("pane.process_info", {"pane_id": pane_id})["process_info"]
     pid = next(
         (p["pid"] for p in info.get("foreground_processes", []) if p.get("argv0") == "claude"),
@@ -173,25 +198,19 @@ def claude_identity(pane_id):
     )
     if pid is None:
         return None
-    claude_dir = os.path.expanduser("~/.claude")
     with open(os.path.join(claude_dir, "sessions", f"{pid}.json")) as session_file:
         session = json.load(session_file)
-    # No transcript exists until a session's first message.
-    pattern = os.path.join(claude_dir, "projects", "*", f"{session['sessionId']}.jsonl")
-    matches = glob.glob(pattern)
-    identity = read_transcript_identity(matches[0]) if matches else {"name": None, "color": None}
-    identity["name"] = user_session_name(session) or identity["name"]
-    return identity
+    return transcript_identity(claude_dir, session["sessionId"], session)
 
 
 def refresh_identities(snap, identities):
     """Update Claude identities in place, keeping the last good value on errors."""
-    panes = {a["pane_id"] for a in snap.get("agents", []) if a.get("agent") == "claude"}
-    for pane_id in set(identities) - panes:
+    agents = {a["pane_id"]: a for a in snap.get("agents", []) if a.get("agent") == "claude"}
+    for pane_id in set(identities) - set(agents):
         del identities[pane_id]
-    for pane_id in panes:
+    for pane_id, agent in agents.items():
         try:
-            identity = claude_identity(pane_id)
+            identity = claude_identity(pane_id, agent)
         except (OSError, RuntimeError, ValueError, KeyError):
             continue
         if identity is not None:

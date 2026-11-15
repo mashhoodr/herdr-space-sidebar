@@ -42,6 +42,7 @@ from spaces_list import (
     rightmost_pane,
     sync_list,
     user_session_name,
+    claude_identity,
 )
 
 
@@ -169,6 +170,20 @@ class SessionIdentity(unittest.TestCase):
     def test_agents_without_identity_have_no_color(self):
         rows = {r["target"]: r for r in build_rows(snapshot())}
         self.assertIsNone(rows["w1:p1"]["color"])
+
+
+    def test_reported_session_id_finds_the_transcript_without_process_lookup(self):
+        with tempfile.TemporaryDirectory() as home:
+            project = os.path.join(home, ".claude", "projects", "-proj")
+            os.makedirs(project)
+            with open(os.path.join(project, "abc-123.jsonl"), "w") as transcript:
+                transcript.write('{"type":"custom-title","customTitle":"sandboxed"}\n')
+            agent = {"agent_session": {"kind": "id", "value": "abc-123"}}
+            with mock.patch.dict(os.environ, {"HOME": home}), \
+                    mock.patch("spaces_list.rpc") as rpc:
+                identity = claude_identity("w1:p1", agent)
+            rpc.assert_not_called()
+            self.assertEqual(identity["name"], "sandboxed")
 
 
 class Selection(unittest.TestCase):
