@@ -25,6 +25,9 @@ HELPER_LABELS = (LABEL, "Sidebar")
 SHELLS = ("fish", "zsh", "bash", "sh", "dash", "ksh")
 MIN_TAB_WIDTH = 100
 WIDTH = 32
+# A right-edge pane narrower than this (a dashboard, say) isn't split: the list
+# docks just left of it, taking its columns from the wider pane there.
+NARROW_NEIGHBOUR = 3 * WIDTH
 # herdr-sidebar's panes: file tree, source control, preview and editor. The list
 # steps aside while one is open in a tab, since files need the width more.
 PREVIEW_TOKENS = ("herdr-sidebar-preview", "herdr-sidebar-explorer", "herdr-sidebar-git")
@@ -386,10 +389,25 @@ def locate_self(snap, pane_id, tab_id, terminal_id):
 
 
 def rightmost_pane(snap, tab_id):
-    """The pane to split when docking: the right column, topmost first."""
+    """The pane to split when docking: the right column, topmost first.
+
+    A narrow right column (a dashboard, say) much narrower than the pane beside it
+    would be squeezed to half its width, so the list docks just left of it instead,
+    splitting that wider pane.
+    """
     for layout in snap.get("layouts", []):
-        if layout.get("tab_id") == tab_id and layout.get("panes"):
-            return min(layout["panes"], key=lambda p: (-(p["rect"]["x"] + p["rect"]["width"]), p["rect"]["y"]))
+        if layout.get("tab_id") != tab_id or not layout.get("panes"):
+            continue
+        panes = layout["panes"]
+        right = min(panes, key=lambda p: (-(p["rect"]["x"] + p["rect"]["width"]), p["rect"]["y"]))
+        if right["rect"]["width"] >= NARROW_NEIGHBOUR or right["rect"]["x"] == 0:
+            return right
+        beside = [p for p in panes if p["rect"]["x"] + p["rect"]["width"] == right["rect"]["x"]]
+        if not beside:
+            return right
+        wide = max(beside, key=lambda p: (p["rect"]["width"], -p["rect"]["y"]))
+        # Only step past the right column when it's much narrower than its neighbour.
+        return wide if wide["rect"]["width"] >= 2 * right["rect"]["width"] else right
     return None
 
 

@@ -333,6 +333,29 @@ class MoveList(unittest.TestCase):
         herdr.assert_not_called()
 
 
+class DockTarget(unittest.TestCase):
+    @staticmethod
+    def snap(*panes):
+        return {"layouts": [{"tab_id": "t", "panes": [
+            {"pane_id": i, "rect": {"x": x, "y": y, "width": w}} for i, x, y, w in panes]}]}
+
+    def test_a_wide_right_pane_is_split(self):
+        snap = self.snap(("agent", 0, 0, 100), ("other", 100, 0, 124))
+        self.assertEqual(rightmost_pane(snap, "t")["pane_id"], "other")
+
+    def test_a_narrow_right_pane_keeps_its_width(self):
+        snap = self.snap(("agent", 0, 0, 190), ("dash", 190, 0, 34))
+        self.assertEqual(rightmost_pane(snap, "t")["pane_id"], "agent")
+
+    def test_the_widest_pane_beside_a_narrow_column_is_chosen(self):
+        snap = self.snap(("top", 0, 0, 150), ("bottom", 0, 30, 190), ("dash", 190, 0, 34))
+        self.assertEqual(rightmost_pane(snap, "t")["pane_id"], "bottom")
+
+    def test_a_narrow_tab_with_one_column_still_docks(self):
+        snap = self.snap(("only", 0, 0, 80))
+        self.assertEqual(rightmost_pane(snap, "t")["pane_id"], "only")
+
+
 class SyncList(unittest.TestCase):
     @staticmethod
     def snap(*panes, focused="a2", zoomed=False, width=180):
