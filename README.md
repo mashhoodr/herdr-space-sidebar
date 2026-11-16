@@ -8,6 +8,12 @@ A [herdr](https://github.com/herdrdev/herdr) plugin that merges the Spaces and A
 
 Status symbols: `!` blocked, `✓` done, `◐` working, `○` idle, `·` nothing detected.
 
+- **Done stays done until you look.** An agent that finishes while you're elsewhere keeps its `✓` until you focus its pane (or it starts working again); herdr's own `done` fades to idle within seconds.
+- **Idle agents age.** After 15 minutes idle the symbol dims; after 2 hours the whole row fades, so the agents you're actually using stand out.
+- **Busiest space first.** Spaces needing attention come first (blocked, then done), then the most recently active. To keep herdr's own order instead, put `order = "herdr"` in `~/.config/herdr/plugins/config/spaces-list/config.toml`.
+
+The list remembers this across reopening and reloads (`~/.local/state/herdr/plugins/spaces-list/activity.json`).
+
 ## Install
 
 Requires herdr 0.9+ and `python3` on Linux or macOS. There is nothing to build.

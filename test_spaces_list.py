@@ -7,6 +7,11 @@ import unittest
 from unittest import mock
 
 from spaces_list import (
+    Activity,
+    OLD_AFTER,
+    STALE_AFTER,
+    configured_order,
+    row_styles,
     agent_kind_tag,
     ONE_DARK,
     PAD_Y,
@@ -86,6 +91,139 @@ def snapshot():
             ]},
         ],
     }
+
+
+
+class Clock:
+    def __init__(self, t=1_000_000.0):
+        self.t = t
+
+    def __call__(self):
+        return self.t
+
+
+def activity_snap(statuses, focused="w9:p9"):
+    """Two spaces; statuses maps pane -> herdr status. w1 holds p1, p2; w2 holds p3."""
+    space_of = {"w1:p1": "w1", "w1:p2": "w1", "w2:p3": "w2"}
+    return {
+        "focused_workspace_id": focused.split(":")[0],
+        "focused_pane_id": focused,
+        "workspaces": [
+            {"workspace_id": "w1", "label": "first", "agent_status": "idle", "tab_count": 1, "active_tab_id": "w1:t1"},
+            {"workspace_id": "w2", "label": "second", "agent_status": "idle", "tab_count": 1, "active_tab_id": "w2:t1"},
+        ],
+        "tabs": [{"tab_id": "w1:t1", "number": 1}, {"tab_id": "w2:t1", "number": 1}],
+        "agents": [
+            {"pane_id": pane, "workspace_id": space_of[pane], "tab_id": f"{space_of[pane]}:t1",
+             "agent": "claude", "agent_status": status, "terminal_title_stripped": pane}
+            for pane, status in statuses.items()
+        ],
+    }
+
+
+class StickyDone(unittest.TestCase):
+    def test_a_turn_finished_elsewhere_stays_done_until_focused(self):
+        clock = Clock(); act = Activity(clock=clock)
+        act.update(activity_snap({"w1:p1": "working"}))
+        clock.t += 5
+        self.assertEqual(act.update(activity_snap({"w1:p1": "idle"}))["w1:p1"]["state"], "done")
+        clock.t += 3600  # still done an hour later: herdr's own done would have lapsed
+        self.assertEqual(act.update(activity_snap({"w1:p1": "idle"}))["w1:p1"]["state"], "done")
+        self.assertEqual(act.update(activity_snap({"w1:p1": "idle"}, focused="w1:p1"))["w1:p1"]["state"], "idle")
+        self.assertEqual(act.update(activity_snap({"w1:p1": "idle"}))["w1:p1"]["state"], "idle")
+
+    def test_finishing_while_focused_is_seen(self):
+        act = Activity(clock=Clock())
+        act.update(activity_snap({"w1:p1": "working"}, focused="w1:p1"))
+        self.assertEqual(act.update(activity_snap({"w1:p1": "idle"}, focused="w1:p1"))["w1:p1"]["state"], "idle")
+
+    def test_herdrs_own_done_is_sticky_and_working_again_clears_it(self):
+        act = Activity(clock=Clock())
+        self.assertEqual(act.update(activity_snap({"w1:p1": "done"}))["w1:p1"]["state"], "done")
+        self.assertEqual(act.update(activity_snap({"w1:p1": "idle"}))["w1:p1"]["state"], "done")
+        self.assertEqual(act.update(activity_snap({"w1:p1": "working"}))["w1:p1"]["state"], "working")
+
+    def test_blocked_is_never_overridden(self):
+        act = Activity(clock=Clock())
+        act.update(activity_snap({"w1:p1": "done"}))
+        self.assertEqual(act.update(activity_snap({"w1:p1": "blocked"}))["w1:p1"]["state"], "blocked")
+
+    def test_memory_survives_a_reopened_list(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "activity.json"); clock = Clock()
+            first = Activity(path, clock)
+            first.update(activity_snap({"w1:p1": "working"}))
+            first.update(activity_snap({"w1:p1": "idle"}))
+            again = Activity(path, clock)
+            self.assertEqual(again.update(activity_snap({"w1:p1": "idle"}))["w1:p1"]["state"], "done")
+
+    def test_closed_panes_are_forgotten(self):
+        act = Activity(clock=Clock())
+        act.update(activity_snap({"w1:p1": "idle", "w1:p2": "idle"}))
+        act.update(activity_snap({"w1:p1": "idle"}))
+        self.assertNotIn("w1:p2", act.panes)
+
+
+class IdleAgeing(unittest.TestCase):
+    def ages(self, act, statuses):
+        return {p: v["age"] for p, v in act.update(activity_snap(statuses)).items()}
+
+    def test_ages_by_time_since_the_last_turn(self):
+        clock = Clock(); act = Activity(clock=clock)
+        act.update(activity_snap({"w1:p1": "working"}, focused="w1:p1"))
+        act.update(activity_snap({"w1:p1": "idle"}, focused="w1:p1"))
+        self.assertEqual(self.ages(act, {"w1:p1": "idle"})["w1:p1"], "fresh")
+        clock.t += STALE_AFTER
+        self.assertEqual(self.ages(act, {"w1:p1": "idle"})["w1:p1"], "stale")
+        clock.t += OLD_AFTER
+        self.assertEqual(self.ages(act, {"w1:p1": "idle"})["w1:p1"], "old")
+
+    def test_an_agent_first_seen_idle_starts_dimmed_not_faded(self):
+        self.assertEqual(self.ages(Activity(clock=Clock()), {"w1:p1": "idle"})["w1:p1"], "stale")
+
+    def test_only_idle_rows_age(self):
+        act = Activity(clock=Clock())
+        view = act.update(activity_snap({"w1:p1": "working", "w1:p2": "done"}))
+        self.assertIsNone(view["w1:p1"]["age"]); self.assertIsNone(view["w1:p2"]["age"])
+
+    def test_old_rows_fade_except_the_current_one(self):
+        dim = 1 << 20
+        with mock.patch("spaces_list.curses.A_DIM", dim), mock.patch("spaces_list.curses.A_BOLD", 1):
+            old = {"kind": "agent", "state": "idle", "age": "old", "current": False}
+            stale = dict(old, age="stale")
+            self.assertTrue(row_styles(old, {})[1] & dim)
+            self.assertTrue(row_styles(stale, {})[0] & dim)
+            self.assertFalse(row_styles(stale, {})[1] & dim)
+            self.assertFalse(row_styles(dict(old, current=True), {})[1] & dim)
+
+
+class ActivityOrder(unittest.TestCase):
+    def order(self, rows):
+        return [r["target"] for r in rows if r["kind"] == "space"]
+
+    def test_most_recently_active_space_comes_first(self):
+        clock = Clock(); act = Activity(clock=clock)
+        act.update(activity_snap({"w1:p1": "idle", "w2:p3": "idle"}))
+        clock.t += 60
+        snap = activity_snap({"w1:p1": "idle", "w2:p3": "working"})
+        self.assertEqual(self.order(build_rows(snap, view=act.update(snap))), ["w2", "w1"])
+        self.assertEqual(self.order(build_rows(snap, view=act.update(snap), order="herdr")), ["w1", "w2"])
+
+    def test_attention_still_beats_recency(self):
+        clock = Clock(); act = Activity(clock=clock)
+        act.update(activity_snap({"w1:p1": "working", "w2:p3": "idle"}))
+        clock.t += 60
+        act.update(activity_snap({"w1:p1": "idle", "w2:p3": "idle"}))  # w1 finishes unseen
+        clock.t += 60
+        snap = activity_snap({"w1:p1": "idle", "w2:p3": "working"})
+        rows = build_rows(snap, view=act.update(snap))
+        self.assertEqual(self.order(rows), ["w1", "w2"])
+        self.assertEqual(rows[0]["state"], "done")  # the space shows the sticky done
+
+    def test_order_setting(self):
+        self.assertEqual(configured_order('order = "herdr"'), "herdr")
+        self.assertEqual(configured_order(""), "activity")
+        self.assertEqual(configured_order('order = "nonsense"'), "activity")
 
 
 class BuildRows(unittest.TestCase):

@@ -249,6 +249,124 @@ def attention_sorted(spaces):
     return sorted(spaces, key=lambda s: ATTENTION_ORDER.get(s.get("agent_status"), 2))
 
 
+# --- Activity memory: what herdr's snapshot doesn't keep -------------------------------------
+# A finished turn you haven't looked at stays "done" (herdr lets done lapse to idle within
+# seconds), and idle agents age: dimmed after STALE_AFTER, the whole row faded after OLD_AFTER.
+STALE_AFTER = 15 * 60
+OLD_AFTER = 2 * 60 * 60
+BUSY = ("working", "blocked")
+SPACE_STATE_PRIORITY = ("blocked", "done", "working", "idle", "unknown")
+ORDERS = ("activity", "herdr")
+
+
+class Activity:
+    """Per-pane memory across refreshes, saved to the plugin's state dir so a reopened list
+    (or one reloaded after a code change) remembers. `update(snap)` returns
+    {pane_id: {"state", "age", "last_active"}} for build_rows."""
+
+    def __init__(self, path=None, clock=time.time):
+        self.path, self.clock, self.panes = path, clock, {}
+        if path:
+            try:
+                with open(path, encoding="utf-8") as saved:
+                    self.panes = json.load(saved)
+            except (OSError, ValueError):
+                self.panes = {}
+
+    def save(self):
+        if not self.path:
+            return
+        tmp = f"{self.path}.tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as out:
+                json.dump(self.panes, out)
+            os.replace(tmp, self.path)
+        except OSError:
+            pass
+
+    def update(self, snap):
+        now, focused = self.clock(), snap.get("focused_pane_id")
+        before = json.dumps(self.panes, sort_keys=True)
+        view, live = {}, set()
+        for agent in snap.get("agents", []):
+            pane = agent["pane_id"]
+            live.add(pane)
+            status = agent.get("agent_status") or "unknown"
+            # First sight with no history: assume "a while ago" (dimmed, not faded).
+            rec = self.panes.setdefault(pane, {"status": None, "last_active": now - STALE_AFTER, "unseen": False})
+            if status in BUSY:
+                rec["last_active"] = now
+                if status == "working":
+                    rec["unseen"] = False
+            elif rec["status"] in BUSY and status in ("idle", "done"):
+                rec["last_active"] = now  # a turn just ended
+                rec["unseen"] = pane != focused
+            if status == "done" and pane != focused:
+                rec["unseen"] = True  # herdr's own "finished, not yet seen"
+            if pane == focused:
+                rec["unseen"] = False
+            rec["status"] = status
+            state = status
+            if status in ("idle", "done"):
+                state = "done" if rec["unseen"] else "idle"
+            age = None
+            if state == "idle":
+                idle_for = now - (rec["last_active"] or now)
+                age = "old" if idle_for >= OLD_AFTER else "stale" if idle_for >= STALE_AFTER else "fresh"
+            view[pane] = {"state": state, "age": age, "last_active": rec["last_active"] or 0}
+        for gone in set(self.panes) - live:
+            del self.panes[gone]
+        if json.dumps(self.panes, sort_keys=True) != before:
+            self.save()
+        return view
+
+
+def space_state(space, agents, view):
+    """A space's symbol from its agents' (sticky) states; herdr's own when it has none."""
+    states = {view.get(a["pane_id"], {}).get("state", a.get("agent_status")) for a in agents}
+    for state in SPACE_STATE_PRIORITY:
+        if state in states:
+            return state
+    return space.get("agent_status", "unknown")
+
+
+def plugin_config_path():
+    base = os.environ.get("HERDR_PLUGIN_CONFIG_DIR") or os.path.join(
+        os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"),
+        "herdr", "plugins", "config", PLUGIN_ID,
+    )
+    return os.path.join(base, "config.toml")
+
+
+def configured_order(text):
+    """`order = "activity"` (default: most recently active space first, after blocked/done)
+    or `"herdr"` (herdr's own space order), from the plugin's config.toml."""
+    try:
+        import tomllib
+        order = tomllib.loads(text).get("order", "activity")
+    except (ImportError, ValueError, AttributeError):
+        return "activity"
+    return order if order in ORDERS else "activity"
+
+
+def load_order():
+    try:
+        with open(plugin_config_path(), encoding="utf-8") as config:
+            return configured_order(config.read())
+    except OSError:
+        return "activity"
+
+
+def ordered_spaces(spaces, states, last_active, order="activity"):
+    """Attention first (blocked, then done), then most recent activity, or herdr's order."""
+    def key(item):
+        index, space = item
+        attention = ATTENTION_ORDER.get(states[space["workspace_id"]], 2) if SORT_BY_ATTENTION else 0
+        recency = -last_active.get(space["workspace_id"], 0) if order == "activity" else 0
+        return (attention, recency, index)
+    return [space for _, space in sorted(enumerate(spaces), key=key)]
+
+
 def text_width(text):
     """Terminal columns a string occupies; wide characters take two."""
     width = 0
@@ -327,38 +445,53 @@ def edit_query(query, key):
     return query
 
 
-def build_rows(snap, identities=None):
-    """Flatten a session snapshot into space rows followed by their agents."""
+def build_rows(snap, identities=None, view=None, order="activity"):
+    """Flatten a session snapshot into space rows followed by their agents.
+
+    `view` comes from Activity.update: sticky states, idle age and last activity per pane.
+    Without it (tests, or before the first update) rows use herdr's states as they are."""
     identities = identities or {}
     tab_numbers = {t["tab_id"]: t.get("number", 0) for t in snap.get("tabs", [])}
     tab_labels = {t["tab_id"]: t.get("label", "") for t in snap.get("tabs", [])}
     focused_space = snap.get("focused_workspace_id")
     focused_pane = snap.get("focused_pane_id")
     rows = []
-    for space in attention_sorted(snap.get("workspaces", [])):
+    spaces = snap.get("workspaces", [])
+    by_space = {s["workspace_id"]: [a for a in snap.get("agents", []) if a.get("workspace_id") == s["workspace_id"]]
+                for s in spaces}
+    if view is None:
+        ordered, states = attention_sorted(spaces), {s["workspace_id"]: s.get("agent_status", "unknown") for s in spaces}
+    else:
+        states = {s["workspace_id"]: space_state(s, by_space[s["workspace_id"]], view) for s in spaces}
+        last_active = {sid: max((view.get(a["pane_id"], {}).get("last_active", 0) for a in agents), default=0)
+                       for sid, agents in by_space.items()}
+        ordered = ordered_spaces(spaces, states, last_active, order)
+    for space in ordered:
         space_id = space["workspace_id"]
         rows.append({
             "kind": "space",
             "target": space_id,
             "tab": space.get("active_tab_id"),
-            "state": space.get("agent_status", "unknown"),
+            "state": states[space_id],
             "text": space.get("label") or space_id,
             "detail": "",
             "search": (space.get("label") or space_id).lower(),
             "current": space_id == focused_space,
         })
-        agents = [a for a in snap.get("agents", []) if a.get("workspace_id") == space_id]
+        agents = list(by_space[space_id])
         agents.sort(key=lambda a: tab_numbers.get(a.get("tab_id"), 0))
         several_tabs = space.get("tab_count", 1) > 1
         for agent in agents:
             number = tab_numbers.get(agent.get("tab_id"), 0) if several_tabs else 0
             identity = identities.get(agent["pane_id"], {})
             text = agent_text(agent, identity.get("name"))
+            seen = (view or {}).get(agent["pane_id"], {})
             rows.append({
                 "kind": "agent",
                 "target": agent["pane_id"],
                 "tab": agent.get("tab_id"),
-                "state": agent.get("agent_status", "unknown"),
+                "state": seen.get("state", agent.get("agent_status", "unknown")),
+                "age": seen.get("age"),
                 "text": text,
                 "search": agent_search_text(
                     agent, text, tab_labels.get(agent.get("tab_id")), space.get("label")
@@ -975,7 +1108,14 @@ def row_styles(row, colors):
     if row["kind"] == "space":
         return state_attr | curses.A_DIM, curses.A_BOLD
     text_attr = curses.A_BOLD if row["current"] else 0
-    return state_attr, text_attr | colors.get(row.get("color"), 0)
+    text_attr |= colors.get(row.get("color"), 0)
+    # Idle agents age: a dim symbol after STALE_AFTER, the whole row after OLD_AFTER.
+    # The row you're on keeps full contrast so the cursor never disappears.
+    if row.get("age") in ("stale", "old"):
+        state_attr |= curses.A_DIM
+    if row.get("age") == "old" and not row["current"]:
+        text_attr |= curses.A_DIM
+    return state_attr, text_attr
 
 
 def draw_row(window, y, row, last_in_space, colors):
@@ -1054,6 +1194,8 @@ def run(window):
     selected_key = None
     next_refresh = 0.0
     identities, next_identities = {}, 0.0
+    activity = Activity(os.path.join(state_dir(), "activity.json"))
+    order = load_order()
     own_pane = os.environ.get("HERDR_PANE_ID")
     own_tab = os.environ.get("HERDR_TAB_ID")
     own_terminal = None
@@ -1075,7 +1217,7 @@ def run(window):
                 if time.monotonic() >= next_identities:
                     refresh_identities(snap, identities)
                     next_identities = time.monotonic() + IDENTITY_REFRESH_SECONDS
-                all_rows = build_rows(snap, identities)
+                all_rows = build_rows(snap, identities, activity.update(snap), order)
                 followed = followed_key(snap, own_pane, all_rows)
                 if followed:
                     # Focus moved away, so a half-typed filter no longer applies.
